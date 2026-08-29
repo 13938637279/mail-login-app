@@ -25,14 +25,14 @@ function verifyPassword(pw, salt, hash) {
   return crypto.timingSafeEqual(Buffer.from(h, 'hex'), Buffer.from(hash, 'hex'));
 }
 
-const sessions = {};
 const loginFails = {};   // email -> { count, lockUntil }
 const MAX_FAILS = 5;
 const LOCK_MS = 15 * 60 * 1000; // 15 分钟
+function b64url(buf) { return Buffer.from(buf).toString('base64url'); }
+function signHmac(payload) { return crypto.createHmac('sha256', SECRET).update(payload).digest('base64url'); }
 function createSession(email) {
-  const t = crypto.randomBytes(32).toString('hex');
-  sessions[t] = { email, exp: Date.now() + 7 * 24 * 3600 * 1000 };
-  return t;
+  const payload = b64url(JSON.stringify({ email, exp: Date.now() + 7 * 24 * 3600 * 1000 }));
+  return payload + '.' + signHmac(payload);
 }
 
 function readBody(req) {
@@ -60,7 +60,17 @@ function getCookie(req) {
 }
 function getSession(req) {
   const t = getCookie(req);
-  if (t && sessions[t] && sessions[t].exp > Date.now()) return sessions[t];
+  if (!t) return null;
+  const idx = t.lastIndexOf('.');
+  if (idx < 0) return null;
+  const payload = t.slice(0, idx), sig = t.slice(idx + 1);
+  const expected = signHmac(payload);
+  if (sig.length !== expected.length) return null;
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
+    if (data && data.exp > Date.now()) return { email: data.email };
+  } catch (e) {}
   return null;
 }
 
@@ -140,7 +150,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(302, { Location: '/dashboard' }); return res.end();
   }
   if (req.method === 'GET' && p === '/logout') {
-    const t = getCookie(req); if (t) delete sessions[t];
+    res.setHeader('Set-Cookie', 'sid=; HttpOnly; Path=/; Max-Age=0');
     res.writeHead(302, { Location: '/' }); return res.end();
   }
   if (req.method === 'GET' && p === '/dashboard') {
