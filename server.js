@@ -26,6 +26,9 @@ function verifyPassword(pw, salt, hash) {
 }
 
 const sessions = {};
+const loginFails = {};   // email -> { count, lockUntil }
+const MAX_FAILS = 5;
+const LOCK_MS = 15 * 60 * 1000; // 15 分钟
 function createSession(email) {
   const t = crypto.randomBytes(32).toString('hex');
   sessions[t] = { email, exp: Date.now() + 7 * 24 * 3600 * 1000 };
@@ -117,8 +120,22 @@ const server = http.createServer(async (req, res) => {
     const f = parseForm(await readBody(req));
     const email = (f.email || '').trim().toLowerCase();
     const pw = f.password || '';
+    const now = Date.now();
+    const ff = loginFails[email];
+    if (ff && ff.lockUntil > now) {
+      const wait = Math.ceil((ff.lockUntil - now) / 60000);
+      return res.end(authPage('login', null, `尝试次数过多，请 ${wait} 分钟后再试`));
+    }
     const rec = getUser.get(email);
-    if (!rec || !verifyPassword(pw, rec.salt, rec.hash)) return res.end(authPage('login', null, '邮箱或密码错误'));
+    if (!rec || !verifyPassword(pw, rec.salt, rec.hash)) {
+      const cur = loginFails[email] || { count: 0, lockUntil: 0 };
+      cur.count++;
+      if (cur.count >= MAX_FAILS) { cur.lockUntil = now + LOCK_MS; cur.count = 0; }
+      loginFails[email] = cur;
+      if (cur.lockUntil > now) return res.end(authPage('login', null, '尝试次数过多，15 分钟后再试'));
+      return res.end(authPage('login', null, '邮箱或密码错误'));
+    }
+    delete loginFails[email];
     const t = createSession(email); setCookie(res, t);
     res.writeHead(302, { Location: '/dashboard' }); return res.end();
   }
