@@ -7,9 +7,18 @@ const { DatabaseSync } = require('node:sqlite');
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = path.join(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'users.db');
-const SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
+function loadSecret() {
+  if (process.env.SESSION_SECRET) return process.env.SESSION_SECRET;
+  const sf = path.join(DATA_DIR, '.session_secret');
+  try { const s = fs.readFileSync(sf, 'utf8').trim(); if (s) return s; } catch (e) {}
+  const s = crypto.randomBytes(32).toString('hex');
+  fs.writeFileSync(sf, s);
+  return s;
+}
+const SECRET = loadSecret();
+
 const db = new DatabaseSync(DB_FILE);
 db.exec('CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, salt TEXT NOT NULL, hash TEXT NOT NULL, created INTEGER NOT NULL)');
 const insUser = db.prepare('INSERT INTO users (email, salt, hash, created) VALUES (?, ?, ?, ?)');
