@@ -1,0 +1,11 @@
+services:
+  app:
+    build: .
+    container_name: mail-login-app
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - PORT=3000
+    volumes:
+      - ./data:/app/data
