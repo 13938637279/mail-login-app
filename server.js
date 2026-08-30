@@ -236,6 +236,7 @@ const server = http.createServer(async (req, res) => {
     const f = parseForm(await readBody(req));
     const email = (f.email || '').toLowerCase(); const action = f.action;
     if (!getUser.get(email)) { res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('用户不存在'); }
+    if (email === ADMIN_EMAIL) { res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('最高管理员账号不可被操作'); }
     if (email === me.email && action !== 'role') { res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('不能对自己操作'); }
     if (action === 'ban') setStatus.run('banned', email);
     else if (action === 'unban') setStatus.run('active', email);
