@@ -211,7 +211,7 @@ const server = http.createServer(async (req, res) => {
             var roleBtn = u.role!=='admin' ? '<button class="btn-sm" data-em="'+u.email+'" data-a="role">设管理员</button> ' : '';
             var stBtn = '<button class="btn-sm" data-em="'+u.email+'" data-a="'+(u.status==='banned'?'unban':'ban')+'">'+(u.status==='banned'?'解封':'封禁')+'</button> ';
             var delBtn = '<button class="btn-sm" data-em="'+u.email+'" data-a="delete">删除</button>';
-            h += '<tr><td>'+u.email+'</td><td>'+t+'</td><td class="'+(u.role==='admin'?'adm':'usr')+'">'+u.role+'</td><td>'+u.status+'</td><td>'+roleBtn+stBtn+delBtn+'</td></tr>';
+            h += '<tr><td>'+u.email+'</td><td>'+t+'</td><td class="'+(u.role==='admin'?'adm':'usr')+'">'+u.role+(u.super?' ⭐':'')+'</td><td>'+u.status+'</td><td>'+(u.super?'—':roleBtn+stBtn+delBtn)+'</td></tr>';
           });
           document.getElementById('rows').innerHTML=h;
           document.querySelectorAll('#rows button').forEach(function(b){ b.onclick=function(){act(b.getAttribute('data-em'),b.getAttribute('data-a'))}; });
@@ -227,7 +227,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && p === '/admin/users') {
     const s = getSession(req); if (!s) { res.writeHead(401, { 'Content-Type': 'application/json' }); return res.end('[]'); }
     const u = getUser.get(s.email); if (!u || u.role !== 'admin') { res.writeHead(403, { 'Content-Type': 'application/json' }); return res.end('[]'); }
-    const rows = listUsers.all().map(r => ({ email: r.email, created: Math.floor((r.created || 0) / 1000), role: r.role, status: r.status }));
+    const rows = listUsers.all().map(r => ({ email: r.email, created: Math.floor((r.created || 0) / 1000), role: r.role, status: r.status, super: r.email === ADMIN_EMAIL }));
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' }); return res.end(JSON.stringify(rows));
   }
   if (req.method === 'POST' && p === '/admin/users') {
