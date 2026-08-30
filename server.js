@@ -22,9 +22,16 @@ function loadSecret() {
 const SECRET = loadSecret();
 
 const db = new DatabaseSync(DB_FILE);
-db.exec('CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, created INTEGER NOT NULL, role TEXT NOT NULL DEFAULT \'user\', status TEXT NOT NULL DEFAULT \'active\')');
-try { db.exec('ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT \'user\''); } catch (e) {}
-try { db.exec('ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT \'active\''); } catch (e) {}
+// 旧版(密码登录)的 users 表有 salt/hash 非空列, 会导致 email-code 登录插不进用户 → 检测到旧结构就迁移重建(保留 email/created)
+let hasOldSchema = false;
+try { db.prepare('SELECT salt FROM users LIMIT 1').get(); hasOldSchema = true; } catch (e) {}
+if (hasOldSchema) {
+  db.exec('ALTER TABLE users RENAME TO users_old');
+  db.exec("CREATE TABLE users (email TEXT PRIMARY KEY, created INTEGER NOT NULL, role TEXT NOT NULL DEFAULT 'user', status TEXT NOT NULL DEFAULT 'active')");
+  db.exec("INSERT INTO users (email, created, role, status) SELECT email, created, 'user', 'active' FROM users_old");
+  db.exec('DROP TABLE users_old');
+}
+db.exec("CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, created INTEGER NOT NULL, role TEXT NOT NULL DEFAULT 'user', status TEXT NOT NULL DEFAULT 'active')");
 const insUser = db.prepare('INSERT OR IGNORE INTO users (email, created, role) VALUES (?, ?, ?)');
 const getUser = db.prepare('SELECT email, created, role, status FROM users WHERE email = ?');
 const listUsers = db.prepare('SELECT email, created, role, status FROM users ORDER BY created DESC');
@@ -167,6 +174,7 @@ const server = http.createServer(async (req, res) => {
     let user = getUser.get(email);
     if (!user) { insUser.run(email, Date.now(), email === ADMIN_EMAIL ? 'admin' : 'user'); user = getUser.get(email); }
     else if (email === ADMIN_EMAIL && user.role !== 'admin') { setRole.run('admin', email); user = getUser.get(email); }
+    if (!user) { res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('注册失败，请重试'); }
     if (user.status === 'banned') { res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('该账号已被封禁'); }
     const t = createSession(email); setCookie(res, t);
     res.writeHead(302, { Location: user.role === 'admin' ? '/admin' : '/user' }); return res.end();
