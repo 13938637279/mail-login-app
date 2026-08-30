@@ -8,6 +8,7 @@ const { DatabaseSync } = require('node:sqlite');
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = path.join(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'users.db');
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').toLowerCase();
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 function loadSecret() {
@@ -21,8 +22,16 @@ function loadSecret() {
 const SECRET = loadSecret();
 
 const db = new DatabaseSync(DB_FILE);
-db.exec('CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, created INTEGER NOT NULL)');
-const insUser = db.prepare('INSERT OR IGNORE INTO users (email, created) VALUES (?, ?)');
+db.exec('CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, created INTEGER NOT NULL, role TEXT NOT NULL DEFAULT \'user\', status TEXT NOT NULL DEFAULT \'active\')');
+try { db.exec('ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT \'user\''); } catch (e) {}
+try { db.exec('ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT \'active\''); } catch (e) {}
+const insUser = db.prepare('INSERT OR IGNORE INTO users (email, created, role) VALUES (?, ?, ?)');
+const getUser = db.prepare('SELECT email, created, role, status FROM users WHERE email = ?');
+const listUsers = db.prepare('SELECT email, created, role, status FROM users ORDER BY created DESC');
+const setRole = db.prepare('UPDATE users SET role = ? WHERE email = ?');
+const setStatus = db.prepare('UPDATE users SET status = ? WHERE email = ?');
+const delUser = db.prepare('DELETE FROM users WHERE email = ?');
+const countUsers = db.prepare('SELECT COUNT(*) AS n FROM users');
 
 // ---- 发信(SMTP) ----
 const mailer = nodemailer.createTransport({
@@ -34,7 +43,7 @@ const mailer = nodemailer.createTransport({
 const MAIL_FROM = process.env.SMTP_FROM || process.env.SMTP_USER || '';
 
 // ---- 邮箱验证码 ----
-const emailCodes = {}; // email -> { code, exp }
+const emailCodes = {};
 const CODE_LIFE = 5 * 60 * 1000;
 function sendCode(email) {
   const code = String(crypto.randomInt(100000, 1000000));
@@ -43,7 +52,7 @@ function sendCode(email) {
   return mailer.sendMail({ from: MAIL_FROM, to: email, subject: 'wuchenyun.top 登录验证码', text: txt });
 }
 
-// ---- 滑动会话(3天) ----
+// ---- 会话(3天滑动) ----
 const SESSION_MS = 3 * 24 * 3600 * 1000;
 function b64url(buf) { return Buffer.from(buf).toString('base64url'); }
 function signHmac(payload) { return crypto.createHmac('sha256', SECRET).update(payload).digest('base64url'); }
@@ -104,8 +113,11 @@ function html(title, body) {
   button{width:100%;margin-top:18px;padding:12px;background:#3b82f6;color:#fff;border:0;border-radius:8px;font-size:15px;cursor:pointer}
   button:hover{background:#2f6fd0}.err{color:#dc2626;font-size:13px;margin-top:10px}.ok{color:#16a34a;font-size:13px;margin-top:10px}
   .msg{font-size:14px;margin-bottom:8px}.link{display:block;text-align:center;margin-top:16px;color:#3b82f6;font-size:14px;text-decoration:none}
-  a.logout{position:fixed;top:16px;right:20px;color:#666;font-size:14px;text-decoration:none}.row{display:flex;gap:10px}.row button{width:auto;margin:0;padding:11px 14px;white-space:nowrap}</style></head><body>${body}</body></html>`;
+  a.logout{position:fixed;top:16px;right:20px;color:#666;font-size:14px;text-decoration:none}.row{display:flex;gap:10px}.row button{width:auto;margin:0;padding:11px 14px;white-space:nowrap}
+  table{width:100%;border-collapse:collapse;margin-top:12px}.tp{text-align:left;padding:8px;border-bottom:1px solid #eee;font-size:14px}.tp th{border-bottom:2px solid #eee;color:#555;font-weight:600}.pp{background:#fff}.sel{background:#f8fafc}
+  .btn-sm{padding:4px 10px;font-size:12px;margin:0 3px;width:auto}.adm{color:#dc2626;font-weight:600}.usr{color:#16a34a}</style></head><body>${body}</body></html>`;
 }
+
 function authPage(msg, err) {
   const m = msg ? `<div class="msg ok">${msg}</div>` : (err ? `<div class="msg err">${err}</div>` : '');
   return html('登录', `<div class="card"><h1>wuchenyun.top</h1><h2>邮箱验证码登录</h2>${m}
@@ -119,13 +131,20 @@ function authPage(msg, err) {
     </script></body></html>`);
 }
 
+function userPage(email) {
+  return html('控制台', `<a class="logout" href="/logout">退出</a>
+    <div class="card" style="max-width:560px"><h1>欢迎，${email}</h1>
+    <p style="color:#555;font-size:15px">这是你的私有空间。</p>
+    <div style="margin-top:24px;padding:16px;border:1px dashed #cbd5e1;border-radius:10px;color:#94a3b8;font-size:14px">内容区（待填充）</div></div>`);
+}
+
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://x');
   const p = u.pathname;
 
   if (req.method === 'GET' && (p === '/' || p === '/login')) {
     const s = getSession(req);
-    if (s) { res.writeHead(302, { Location: '/dashboard' }); return res.end(); }
+    if (s) { res.writeHead(302, { Location: (getUser.get(s.email)||{}).role === 'admin' ? '/admin' : '/user' }); return res.end(); }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end(authPage());
   }
@@ -133,46 +152,76 @@ const server = http.createServer(async (req, res) => {
     const f = parseForm(await readBody(req));
     const email = (f.email || '').trim().toLowerCase();
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('邮箱格式不对'); }
-    try {
-      await sendCode(email);
-      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-      return res.end('验证码已发送，请查收邮箱');
-    } catch (e) {
-      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-      return res.end('发送失败，请检查邮件服务配置');
-    }
+    const rec = getUser.get(email);
+    if (rec && rec.status === 'banned') { res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('该账号已被封禁'); }
+    try { await sendCode(email); res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('验证码已发送，请查收邮箱'); }
+    catch (e) { res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('发送失败，请检查邮件服务配置'); }
   }
   if (req.method === 'POST' && p === '/login') {
     const f = parseForm(await readBody(req));
     const email = (f.email || '').trim().toLowerCase();
     const code = (f.code || '').trim();
     const rec = emailCodes[email];
-    if (!rec || rec.exp < Date.now() || rec.code !== code) {
-      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-      return res.end('验证码错误或已过期');
-    }
+    if (!rec || rec.exp < Date.now() || rec.code !== code) { res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('验证码错误或已过期'); }
     delete emailCodes[email];
-    insUser.run(email, Date.now());
+    let user = getUser.get(email);
+    if (!user) { insUser.run(email, Date.now(), email === ADMIN_EMAIL ? 'admin' : 'user'); user = getUser.get(email); }
+    else if (email === ADMIN_EMAIL && user.role !== 'admin') { setRole.run('admin', email); user = getUser.get(email); }
+    if (user.status === 'banned') { res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('该账号已被封禁'); }
     const t = createSession(email); setCookie(res, t);
-    res.writeHead(302, { Location: '/dashboard' }); return res.end();
+    res.writeHead(302, { Location: user.role === 'admin' ? '/admin' : '/user' }); return res.end();
   }
-  if (req.method === 'GET' && p === '/logout') {
-    clearCookie(res);
-    res.writeHead(302, { Location: '/' }); return res.end();
-  }
-  if (req.method === 'GET' && p === '/dashboard') {
-    const s = getSession(req);
-    if (!s) { res.writeHead(302, { Location: '/' }); return res.end(); }
-    // 滑动续期：每次访问刷新 3 天
+  if (req.method === 'GET' && p === '/logout') { clearCookie(res); res.writeHead(302, { Location: '/' }); return res.end(); }
+
+  // ---- 普通用户界面 ----
+  if (req.method === 'GET' && p === '/user') {
+    const s = getSession(req); if (!s) { res.writeHead(302, { Location: '/' }); return res.end(); }
+    const u = getUser.get(s.email);
+    if (u && u.status === 'banned') { clearCookie(res); res.writeHead(302, { Location: '/' }); return res.end(); }
     setCookie(res, createSession(s.email));
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    return res.end(html('控制台', `<a class="logout" href="/logout">退出</a>
-      <div class="card" style="max-width:560px"><h1>欢迎，${s.email}</h1>
-      <p style="color:#555;font-size:15px">这是你的私有空间，登录成功。</p>
-      <div style="margin-top:24px;padding:16px;border:1px dashed #cbd5e1;border-radius:10px;color:#94a3b8;font-size:14px">内容区（待填充）</div></div>`));
+    return res.end(userPage(s.email));
   }
+
+  // ---- 管理界面 ----
+  if (req.method === 'GET' && p === '/admin') {
+    const s = getSession(req); if (!s) { res.writeHead(302, { Location: '/' }); return res.end(); }
+    const u = getUser.get(s.email); if (!u || u.role !== 'admin') { res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('403 无权限'); }
+    setCookie(res, createSession(s.email));
+    const n = countUsers.get().n;
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    return res.end(html('管理后台', `<a class="logout" href="/logout">退出</a>
+      <div class="card" style="max-width:720px"><h1>管理后台</h1><p>总用户数：<b>${n}</b></p>
+      <table class="tp"><tr><th>邮箱</th><th>注册时间</th><th>角色</th><th>状态</th><th>操作</th></tr><tbody id="rows"></tbody></table>
+      <p id="msg" class="msg err"></p></div>
+      <script>
+      async function load(){var r=await fetch('/admin/users');var d=await r.json();var h='';d.forEach(u=>{var t=new Date(u.created*1000).toLocaleString('zh-CN');h+='<tr><td>'+u.email+'</td><td>'+t+'</td><td class="'+(u.role==='admin'?'adm':'usr')+'">'+u.role+'</td><td>'+u.status+'</td><td>'+(u.role!=='admin'?'<button class="btn-sm" onclick="act(\''+u.email+'\',\'role\')">设管理员</button> ':'')+'<button class="btn-sm" onclick="act(\''+u.email+'\',\''+(u.status==='banned'?'unban':'ban')+'\')">'+(u.status==='banned'?'解封':'封禁')+'</button> <button class="btn-sm" onclick="act(\''+u.email+'\',\'delete\')">删除</button></td></tr>'}) ;document.getElementById('rows').innerHTML=h}
+      async function act(em,a){if(a==='delete'&&!confirm('确认删除 '+em+'？'))return;var r=await fetch('/admin/users',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'email='+encodeURIComponent(em)+'&action='+a});var t=await r.text();var m=document.getElementById('msg');m.textContent=t;m.style.color=r.ok?'#16a34a':'#dc2626';load()}
+      load();</script></body></html>`));
+  }
+  if (req.method === 'GET' && p === '/admin/users') {
+    const s = getSession(req); if (!s) { res.writeHead(401, { 'Content-Type': 'application/json' }); return res.end('[]'); }
+    const u = getUser.get(s.email); if (!u || u.role !== 'admin') { res.writeHead(403, { 'Content-Type': 'application/json' }); return res.end('[]'); }
+    const rows = listUsers.all().map(r => ({ email: r.email, created: Math.floor((r.created || 0) / 1000), role: r.role, status: r.status }));
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' }); return res.end(JSON.stringify(rows));
+  }
+  if (req.method === 'POST' && p === '/admin/users') {
+    const s = getSession(req); if (!s) { res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('未登录'); }
+    const me = getUser.get(s.email); if (!me || me.role !== 'admin') { res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('403 无权限'); }
+    const f = parseForm(await readBody(req));
+    const email = (f.email || '').toLowerCase(); const action = f.action;
+    if (!getUser.get(email)) { res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('用户不存在'); }
+    if (email === me.email && action !== 'role') { res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('不能对自己操作'); }
+    if (action === 'ban') setStatus.run('banned', email);
+    else if (action === 'unban') setStatus.run('active', email);
+    else if (action === 'delete') delUser.run(email);
+    else if (action === 'role') { const t = getUser.get(email); setRole.run(t.role === 'admin' ? 'user' : 'admin', email); }
+    else { res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('未知操作'); }
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('操作成功');
+  }
+
   res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(html('404', '<div class="card"><h1>404</h1><p>页面不存在</p><a class="link" href="/">返回</a></div>'));
 });
 
-server.listen(PORT, () => console.log('App listening on :' + PORT + ' (smtp=' + (process.env.SMTP_HOST ? 'on' : 'off') + ')'));
+server.listen(PORT, () => console.log('App listening on :' + PORT));
