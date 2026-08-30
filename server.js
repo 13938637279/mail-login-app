@@ -195,8 +195,25 @@ const server = http.createServer(async (req, res) => {
       <table class="tp"><tr><th>邮箱</th><th>注册时间</th><th>角色</th><th>状态</th><th>操作</th></tr><tbody id="rows"></tbody></table>
       <p id="msg" class="msg err"></p></div>
       <script>
-      async function load(){var r=await fetch('/admin/users');var d=await r.json();var h='';d.forEach(u=>{var t=new Date(u.created*1000).toLocaleString('zh-CN');h+='<tr><td>'+u.email+'</td><td>'+t+'</td><td class="'+(u.role==='admin'?'adm':'usr')+'">'+u.role+'</td><td>'+u.status+'</td><td>'+(u.role!=='admin'?'<button class="btn-sm" onclick="act(\''+u.email+'\',\'role\')">设管理员</button> ':'')+'<button class="btn-sm" onclick="act(\''+u.email+'\',\''+(u.status==='banned'?'unban':'ban')+'\')">'+(u.status==='banned'?'解封':'封禁')+'</button> <button class="btn-sm" onclick="act(\''+u.email+'\',\'delete\')">删除</button></td></tr>'}) ;document.getElementById('rows').innerHTML=h}
-      async function act(em,a){if(a==='delete'&&!confirm('确认删除 '+em+'？'))return;var r=await fetch('/admin/users',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'email='+encodeURIComponent(em)+'&action='+a});var t=await r.text();var m=document.getElementById('msg');m.textContent=t;m.style.color=r.ok?'#16a34a':'#dc2626';load()}
+      function load(){
+        fetch('/admin/users').then(function(r){return r.json()}).then(function(d){
+          var h='';var t;
+          d.forEach(function(u){
+            t=new Date(u.created*1000).toLocaleString('zh-CN');
+            var roleBtn = u.role!=='admin' ? '<button class="btn-sm" data-em="'+u.email+'" data-a="role">设管理员</button> ' : '';
+            var stBtn = '<button class="btn-sm" data-em="'+u.email+'" data-a="'+(u.status==='banned'?'unban':'ban')+'">'+(u.status==='banned'?'解封':'封禁')+'</button> ';
+            var delBtn = '<button class="btn-sm" data-em="'+u.email+'" data-a="delete">删除</button>';
+            h += '<tr><td>'+u.email+'</td><td>'+t+'</td><td class="'+(u.role==='admin'?'adm':'usr')+'">'+u.role+'</td><td>'+u.status+'</td><td>'+roleBtn+stBtn+delBtn+'</td></tr>';
+          });
+          document.getElementById('rows').innerHTML=h;
+          document.querySelectorAll('#rows button').forEach(function(b){ b.onclick=function(){act(b.getAttribute('data-em'),b.getAttribute('data-a'))}; });
+        }).catch(function(e){var m=document.getElementById('msg');m.textContent='加载失败';m.style.color='#dc2626'});
+      }
+      function act(em,a){
+        if(a==='delete' && !confirm('确认删除 '+em+'？')) return;
+        fetch('/admin/users',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'email='+encodeURIComponent(em)+'&action='+a})
+          .then(function(r){return r.text()}).then(function(t){var m=document.getElementById('msg');m.textContent=t;m.style.color='#16a34a';load()});
+      }
       load();</script></body></html>`));
   }
   if (req.method === 'GET' && p === '/admin/users') {
