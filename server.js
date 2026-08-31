@@ -31,6 +31,13 @@ function rateLimit(key, limit, windowMs) {
   return e.count > limit;
 }
 function rateLimited(key, limit, windowMs) { return rateLimit(key, limit, windowMs); }
+// 稳定客户端标识：优先取 Cloudflare 恒定真实客户端 IP（CF-Connecting-IP），
+// 否则退回 req.ip。站点在 CF 后，req.ip 会随边缘/上游 IP 变化，不可用于限流。
+function clientIp(req) {
+  const cf = (req.headers['cf-connecting-ip'] || '').toString().trim();
+  if (cf) return cf;
+  return (req.ip || (req.connection && req.connection.remoteAddress) || '').split(',')[0].trim();
+}
 // 定期清理过期的限流计数与过期验证码（防止内存无限增长）
 setInterval(() => {
   const now = Date.now();
@@ -251,9 +258,10 @@ function verifyCode(email, code, consume) {
 app.post('/send-code', async (req, res) => {
   const email = (req.body.email || '').trim().toLowerCase();
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.type('text/plain').send('邮箱格式不对');
-  const ip = req.ip || req.connection.remoteAddress || '';
-  if (rateLimited('sendcode|email|' + email, 1, 60 * 1000)) return res.type('text/plain').send('发送过于频繁，请稍后再试');
-  if (rateLimited('sendcode|ip|' + ip, 10, 15 * 60 * 1000)) return res.type('text/plain').send('操作过于频繁，请稍后再试');
+  const ip = clientIp(req);
+  if (rateLimited('sendcode|email|' + email, 1, 60 * 1000)) return res.type('text/plain').send('发送过于频繁，请稍后再试'); // 冷却60s
+  if (rateLimited('sendcode|email|cnt|' + email, 6, 60 * 60 * 1000)) return res.type('text/plain').send('该邮箱发送次数已达上限，请稍后再试'); // 防轰炸单一收件箱
+  if (rateLimited('sendcode|ip|' + ip, 15, 15 * 60 * 1000)) return res.type('text/plain').send('操作过于频繁，请稍后再试'); // 稳定IP(CF-Connecting-IP)
   const rec = stmts.getUser.get(email);
   if (rec && rec.status === 'banned') return res.type('text/plain').send('发送失败，请检查邮箱'); // 不泄露封禁状态
   try { await sendCode(email); res.type('text/plain').send('验证码已发送，请查收邮箱'); }
@@ -262,8 +270,9 @@ app.post('/send-code', async (req, res) => {
 // 验证码登录：已注册→登录；未注册→返回 {register:true}，前端让设密码（code 保留给 /register 复用）
 app.post('/login-code', (req, res) => {
   const email = (req.body.email || '').trim().toLowerCase(), code = (req.body.code || '').trim();
-  const ip = req.ip || req.connection.remoteAddress || '';
-  if (rateLimited('logincode|' + email + '|' + ip, 10, 5 * 60 * 1000)) return res.type('text/plain').send('尝试过于频繁，请稍后再试');
+  const ip = clientIp(req);
+  if (rateLimited('logincode|email|' + email, 6, 15 * 60 * 1000)) return res.type('text/plain').send('尝试过于频繁，请稍后再试'); // 按目标账号
+  if (rateLimited('logincode|ip|' + ip, 30, 15 * 60 * 1000)) return res.type('text/plain').send('尝试过于频繁，请稍后再试'); // 按稳定IP
   let u = stmts.getUser.get(email);
   if (!u) {
     // 未注册：仅校验验证码（计数防爆破），成功后保留 code 供 /register
@@ -277,20 +286,22 @@ app.post('/login-code', (req, res) => {
 // 注册（验证码登录的新账号 + 设置密码）
 app.post('/register', (req, res) => {
   const email = (req.body.email || '').trim().toLowerCase(), code = (req.body.code || '').trim(), password = (req.body.password || '').trim();
-  const ip = req.ip || req.connection.remoteAddress || '';
-  if (rateLimited('register|' + email + '|' + ip, 10, 5 * 60 * 1000)) return res.type('text/plain').send('尝试过于频繁，请稍后再试');
+  const ip = clientIp(req);
+  if (rateLimited('register|email|' + email, 6, 15 * 60 * 1000)) return res.type('text/plain').send('尝试过于频繁，请稍后再试'); // 按目标账号
+  if (rateLimited('register|ip|' + ip, 30, 15 * 60 * 1000)) return res.type('text/plain').send('尝试过于频繁，请稍后再试'); // 按稳定IP
   if (!verifyCode(email, code, true)) return res.type('text/plain').send('验证码错误或已过期');
   if (password.length < 6) return res.type('text/plain').send('密码至少 6 位');
   stmts.insUser.run(email, Date.now(), email === ADMIN_EMAIL ? 'admin' : 'user');
   stmts.setPassword.run(hashPw(password), email);
   setCookie(res, createSession(email)); res.redirect('/app');
 });
-// 密码登录（统一错误提示，防账号枚举；限流防爆破）
+// 密码登录（统一错误提示，防账号枚举；按目标邮箱+稳定IP限流防爆破）
 app.post('/login-password', (req, res) => {
   const email = (req.body.email || '').trim().toLowerCase(), password = (req.body.password || '');
-  const ip = req.ip || req.connection.remoteAddress || '';
-  if (rateLimited('loginpw|' + email + '|' + ip, 6, 15 * 60 * 1000)) return res.type('text/plain').send('尝试过于频繁，请稍后再试');
   if (!email || !password) return res.type('text/plain').send('邮箱或密码错误');
+  const ip = clientIp(req);
+  if (rateLimited('loginpw|email|' + email, 6, 15 * 60 * 1000)) return res.type('text/plain').send('尝试过于频繁，请稍后再试'); // 关键：按目标账号，分布式IP也绕不过
+  if (rateLimited('loginpw|ip|' + ip, 30, 15 * 60 * 1000)) return res.type('text/plain').send('尝试过于频繁，请稍后再试'); // 按稳定IP
   const u = stmts.getUser.get(email);
   if (!u || u.status === 'banned' || !u.password_hash || !verifyPw(password, u.password_hash)) {
     return res.type('text/plain').send('邮箱或密码错误');
@@ -305,7 +316,7 @@ app.get('/logout', (req, res) => { clearCookie(res); res.redirect('/'); });
 app.get('/api/pdd/callback', pddCallback);
 app.post('/api/pdd/callback', pddCallback);
 function pddCallback(req, res) {
-  const ip = req.ip || req.connection.remoteAddress || '';
+  const ip = clientIp(req);
   if (rateLimited('pdccb|' + ip, 20, 60 * 1000)) return res.status(429).type('text/plain').send('429 请求过于频繁');
   const q = req.query || {}, b = (typeof req.body === 'object' ? req.body : {});
   const code = (q.code || b.code || '').toString();
