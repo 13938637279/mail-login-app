@@ -34,7 +34,17 @@ const ADAPTERS = {
         price: (Number(g.min_group_price || g.min_normal_price) || 0) / 100, // 分为单位 → 元
         img: g.goods_thumbnail_url || g.goods_image_url || '',
         url: `https://mobile.yangkeduo.com/goods.html?goods_id=${g.goods_id}`,
+        _sign: g.goods_sign || '', // 商品签名(详情/报价用)
       }));
+    },
+    // 按商品签名查当前价（每日报价用）; 入参为 (goodsId, goodsSign)，用 goodsSign 调 detail
+    async price(goodsId, goodsSign) {
+      if (!process.env.PDD_CLIENT_ID || !process.env.PDD_PID || !goodsSign) return null;
+      const data = await pddRequest('pdd.ddk.goods.detail', { goods_sign: goodsSign, pid: process.env.PDD_PID });
+      const resp = data && data.goods_detail_response;
+      const list = resp ? (resp.goods_details || resp.goods_list || []) : [];
+      if (list && list.length) return (Number(list[0].min_group_price) || Number(list[0].min_normal_price) || 0) / 100;
+      return null;
     },
   },
 };
@@ -71,4 +81,11 @@ async function searchAll(kw) {
   return results.filter(r => { const k = r.platform + '|' + r.sku; if (seen.has(k)) return false; seen.add(k); return true; });
 }
 
-module.exports = { searchAll, ADAPTERS };
+// 取一个商品的当前价（返回 null 表示无源/失败）；ext 为平台扩展字段（如 pdd 的 goods_sign）
+async function getCurrentPrice(platform, sku, ext) {
+  const ad = ADAPTERS[platform];
+  if (!ad || typeof ad.price !== 'function') return null;
+  try { return await ad.price(sku, ext); } catch (e) { return null; }
+}
+
+module.exports = { searchAll, getCurrentPrice, ADAPTERS };

@@ -1,10 +1,11 @@
 // server.js —— wuchenyun.top 多模块平台 P1/P2（Express + SQLite + 邮箱验证码登录）
 const express = require('express');
 const crypto = require('crypto');
+const os = require('os');
 const nodemailer = require('nodemailer');
 const { db, stmts, p2 } = require('./db');
 const { layout } = require('./layout');
-const { searchAll } = require('./adapters');
+const { searchAll, getCurrentPrice } = require('./adapters');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -188,7 +189,6 @@ app.get('/app', requireUser, (req, res) => {
 });
 const USER_MODULES = {
   profile:   ['个人资料', '登录账号与个人资料管理'],
-  links:     ['我的链接', '收藏的链接'],
   settings:  ['设置', '站点偏好与监控上限'],
 };
 Object.entries(USER_MODULES).forEach(([key, [t, d]]) => {
@@ -204,6 +204,7 @@ function today() { const d = new Date(); return d.getFullYear() + '-' + String(d
 function ensureProduct(platform, sku, info, price) {
   p2.upsertProduct.run(platform, sku, info.title, info.img || '', info.url || '', price, Date.now(), 'fresh');
   const prod = p2.getProductBySku.get(platform, sku);
+  if (info._sign) p2.setExt.run(info._sign, prod.id);
   p2.insertPricePoint.run(prod.id, today(), price, 'fresh');
   return prod;
 }
@@ -409,6 +410,98 @@ app.get('/app/data', requireUser, (req, res) => {
   res.type('html').send(s);
 });
 
+// —— 我的链接：API ——
+app.get('/api/links', requireUser, (req, res) => {
+  const items = p2.listLinks.all(req.user.email).map(r => ({ id: r.id, url: r.url, title: r.title, created_at: r.created_at }));
+  res.json({ items });
+});
+app.post('/api/links', requireUser, (req, res) => {
+  const url = (req.body.url || '').trim();
+  const title = (req.body.title || '').trim() || url;
+  if (url && url.indexOf('http') === 0) {
+    p2.addLink.run(req.user.email, url, title, Date.now());
+    return res.json({ ok: true });
+  }
+  res.status(400).json({ ok: false, error: '链接格式不对' });
+});
+app.delete('/api/links', requireUser, (req, res) => {
+  const id = Number(req.body.id);
+  if (id) p2.delLink.run(id, req.user.email);
+  res.json({ ok: true });
+});
+
+// —— 我的链接 页面 ——
+app.get('/app/links', requireUser, (req, res) => {
+  const s = layout({ title: '我的链接', userEmail: req.user.email, role: req.user.role, active: 'links', content: `
+  <div x-data="linksApp()" x-init="init()">
+    <h1 class="text-2xl font-bold mb-2">我的链接</h1>
+    <p class="text-gray-500 mb-4">保存常用链接。</p>
+    <div class="flex gap-2 mb-5">
+      <input x-model="title" placeholder="标题(可选)" class="w-40 border rounded-lg px-3 py-2 text-sm">
+      <input x-model="url" placeholder="https://..." class="flex-1 border rounded-lg px-3 py-2 text-sm">
+      <button @click="add()" class="bg-blue-600 text-white rounded-lg px-4 text-sm">添加</button>
+    </div>
+    <p x-show="msg" x-text="msg" class="text-sm text-green-600 mb-3"></p>
+    <template x-for="l in links" :key="l.id">
+      <div class="bg-white border border-gray-100 rounded-xl p-3 mb-2 flex items-center justify-between">
+        <div class="min-w-0">
+          <div class="font-medium text-sm truncate" x-text="l.title"></div>
+          <a :href="l.url" target="_blank" class="text-xs text-blue-500 truncate" x-text="l.url"></a>
+        </div>
+        <button @click="del(l)" class="text-xs text-red-500">删除</button>
+      </div>
+    </template>
+    <p x-show="links.length===0" class="text-gray-400 text-sm">还没有链接。</p>
+  </div>
+  <script>
+  window.linksApp = function(){ return {
+    links:[], url:'', title:'', msg:'',
+    init(){ this.load(); },
+    async load(){ const r=await fetch('/api/links'); this.links=(await r.json()).items; },
+    async add(){ if(!this.url||this.url.indexOf('http')!==0){ this.msg='请填 https:// 开头链接'; return; }
+      await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:this.url,title:this.title})});
+      this.url=''; this.title=''; this.msg=''; this.load(); },
+    async del(l){ await fetch('/api/links',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:l.id})}); this.load(); },
+  } };
+  </script>` });
+  res.type('html').send(s);
+});
+
+// ---------- P4：每日报价（非常驻，外部 cron 触发） ----------
+const REFRESH_MAX_LOAD = Number(process.env.REFRESH_MAX_LOAD || 2.0);
+function getLoad() {
+  let l = [0, 0, 0];
+  try { l = os.loadavg(); } catch (e) {}
+  return { load1: l[0].toFixed(2), load5: l[1].toFixed(2), load15: l[2].toFixed(2), rssMB: Math.round(process.memoryUsage().rss / 1024 / 1024) };
+}
+// 外部（1Panel 计划任务/定时 curl）调用；按【去重商品】抓一次，供所有监控者共享；负载高则跳过。
+app.post('/_/cron/refresh-prices', async (req, res) => {
+  // 保护：若设了 CRON_TOKEN，要求请求头 x-cron-token 匹配
+  if (process.env.CRON_TOKEN && req.headers['x-cron-token'] !== process.env.CRON_TOKEN) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  const l = getLoad();
+  if (Number(l.load1) > REFRESH_MAX_LOAD) return res.json({ ok: false, skipped: true, load: l, msg: '负载过高，跳过本次' });
+  const products = p2.listDistinctMonitoredProducts.all();
+  let refreshed = 0, fail = 0, alerts = 0;
+  for (const prod of products) {
+    const price = await getCurrentPrice(prod.platform, prod.sku, prod.ext);
+    if (price == null) { p2.updatePrice.run(prod.last_price, prod.observed_at, 'stale', prod.id); fail++; continue; }
+    const dropped = prod.last_price != null && price < prod.last_price;
+    p2.updatePrice.run(price, Date.now(), 'fresh', prod.id);
+    p2.insertPricePoint.run(prod.id, today(), price, 'fresh');
+    for (const m of p2.listMonitorsByProduct.all(prod.id)) {
+      if (m.target_price != null && price <= m.target_price && dropped) { p2.insertAlert.run(m.user_id, prod.id, price, m.target_price, Date.now()); alerts++; }
+    }
+    refreshed++;
+  }
+  res.json({ ok: true, load: l, monitoredProducts: products.length, refreshed, fail, alerts });
+});
+
+// —— 目标价提醒 ——
+app.get('/api/alerts', requireUser, (req, res) => {
+  const items = p2.listAlertsByUser.all(req.user.email).map(r => ({ id: r.id, title: r.title, platform: r.platform, url: r.url, price: r.price, target_price: r.target_price, created_at: r.created_at }));
+  res.json({ items });
+});
+
 // ---------- 管理员 ----------
 app.get('/admin', requireAdmin, (req, res) => {
   const n = stmts.countUsers.get().n;
@@ -435,14 +528,22 @@ app.get('/admin', requireAdmin, (req, res) => {
     </script>` }) );
 });
 app.get('/admin/monitor', requireAdmin, (req, res) => {
+  const l = getLoad();
+  const monCount = p2.listDistinctMonitoredProducts.all().length;
+  const adminCards = [
+    ['负载(1/5/15)', `${l.load1} / ${l.load5} / ${l.load15}`],
+    ['进程内存RSS', l.rssMB + ' MB'],
+    ['被监控商品(去重)', monCount + ' 个'],
+  ].map(c => `<div class="bg-white rounded-xl border border-gray-100 p-5"><div class="text-sm text-gray-500">${c[0]}</div><div class="text-xl font-bold">${c[1]}</div></div>`).join('');
   res.type('html').send(layout({ title: '网站监控', userEmail: req.user.email, role: req.user.role, active: 'admin', content: `
     <h1 class="text-2xl font-bold mb-6">📈 网站监控</h1>
-    <div class="grid sm:grid-cols-3 gap-4">
-      <div class="bg-white rounded-xl border border-gray-100 p-5"><div class="text-sm text-gray-500">CPU</div><div class="text-xl font-bold">—</div></div>
-      <div class="bg-white rounded-xl border border-gray-100 p-5"><div class="text-sm text-gray-500">内存</div><div class="text-xl font-bold">—</div></div>
-      <div class="bg-white rounded-xl border border-gray-100 p-5"><div class="text-sm text-gray-500">负载</div><div class="text-xl font-bold">—</div></div>
-    </div>
-    <p class="text-gray-400 text-sm mt-6">系统/服务/抓取监测将在 P4 落地，当前为框架占位。</p>` }) );
+    <div class="grid sm:grid-cols-3 gap-4">${adminCards}</div>
+    <div class="bg-white rounded-xl border border-gray-100 p-5 mt-6 text-sm text-gray-600">
+      <div class="font-semibold mb-2">每日报价</div>
+      <p>由外部定时任务调用 <code class="text-xs bg-gray-100 px-1 rounded">POST /_/cron/refresh-prices</code>。负载高于 1 分钟均值
+      <b>${REFRESH_MAX_LOAD}</b> 时自动跳过；按去重商品抓取一次，供所有监控者共享；价格跌破目标价时生成提醒。</p>
+      <p class="text-xs text-gray-400 mt-3">当前负载: ${l.load1}（阈值 ${REFRESH_MAX_LOAD}）</p>
+    </div>` }) );
 });
 app.get('/admin/users', requireAdmin, (req, res) => {
   const rows = stmts.listUsers.all().map(r => ({ email: r.email, created: Math.floor((r.created || 0) / 1000), role: r.role, status: r.status, super: r.email === ADMIN_EMAIL }));
