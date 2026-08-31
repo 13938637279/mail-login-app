@@ -8,6 +8,10 @@ services:
     environment:
       - PORT=3000
       - ADMIN_EMAIL=${ADMIN_EMAIL}
+      - SESSION_SECRET=${SESSION_SECRET}
+      - CRON_TOKEN=${CRON_TOKEN}
+      - MAX_MONITORS=${MAX_MONITORS:-50}
+      - REFRESH_MAX_LOAD=${REFRESH_MAX_LOAD:-2.0}
       - SMTP_HOST=${SMTP_HOST}
       - SMTP_PORT=${SMTP_PORT}
       - SMTP_USER=${SMTP_USER}

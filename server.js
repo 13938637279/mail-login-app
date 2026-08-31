@@ -14,6 +14,63 @@ const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toSt
 
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+app.set('trust proxy', 1); // 服务器在 Cloudflare/反代后，信任 X-Forwarded-Proto 以判定是否 HTTPS
+
+// ---------- 安全加固：HTML 转义 / 限流 / CSRF 防护 / 安全头 / HTTPS 跳转 ----------
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// 简易内存限流（固定窗口）。key 形如 'ip|email' 等。命中超限返回 true。
+const rlMap = new Map();
+function rateLimit(key, limit, windowMs) {
+  const now = Date.now();
+  let e = rlMap.get(key);
+  if (!e || now - e.start > windowMs) { e = { start: now, count: 0 }; rlMap.set(key, e); }
+  e.count++;
+  return e.count > limit;
+}
+function rateLimited(key, limit, windowMs) { return rateLimit(key, limit, windowMs); }
+// 定期清理过期的限流计数与过期验证码（防止内存无限增长）
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of rlMap) { if (now - v.start > 5 * 60 * 1000) rlMap.delete(k); }
+  for (const k of Object.keys(emailCodes)) { if (emailCodes[k].exp < now) delete emailCodes[k]; }
+}, 60 * 1000).unref();
+
+// 安全响应头（防点击劫持/嗅探/MIME 混淆）
+function securityHeaders(req, res, next) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net; " +
+    "style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; img-src 'self' data: https:; " +
+    "connect-src 'self' https:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+  );
+  // 已判定为 HTTPS 时才发 HSTS（浏览器仅在 https 下识别）
+  const https = req.secure || req.headers['x-forwarded-proto'] === 'https';
+  if (https) res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+}
+// HTTPS 由 Cloudflare 边缘强制（推荐开启「Always Use HTTPS」）；此处不做应用层跳转，避免反代头误配导致重定向环路。
+// CSRF 防护：非幂等请求若带 Origin/Referer，必须与站点同源（浏览器跨站 POST 会被拒），无形同源的客户端(服务器/curl)放行
+function csrfGuard(req, res, next) {
+  const m = req.method;
+  if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS') return next();
+  const host = req.headers.host;
+  const origin = req.headers.origin, referer = req.headers.referer;
+  if (!origin && !referer) return next(); // 非浏览器客户端（cron/curl/服务器间）无 Origin
+  const src = origin || referer;
+  try {
+    if (new URL(src).host === host) return next();
+  } catch (e) {}
+  return res.status(403).type('text/plain').send('403 Cross-origin request blocked');
+}
+app.use(securityHeaders);
+app.use(csrfGuard);
 
 // ---------- 邮件验证码 / SMTP ----------
 const mailer = nodemailer.createTransport({
@@ -28,7 +85,7 @@ const emailCodes = {};
 const CODE_LIFE = 5 * 60 * 1000;
 function sendCode(email) {
   const code = String(crypto.randomInt(100000, 1000000));
-  emailCodes[email] = { code, exp: Date.now() + CODE_LIFE };
+  emailCodes[email] = { code, exp: Date.now() + CODE_LIFE, tries: 0 };
   const txt = `【wuchenyun.top】你的登录验证码是 ${code}，5 分钟内有效。若非本人操作请忽略。`;
   return mailer.sendMail({ from: MAIL_FROM, to: email, subject: 'wuchenyun.top 登录验证码', text: txt });
 }
@@ -49,8 +106,12 @@ function getSession(req) {
   } catch (e) {}
   return null;
 }
-function setCookie(res, tok) { res.setHeader('Set-Cookie', `sid=${tok}; HttpOnly; Path=/; Max-Age=${Math.floor(SESSION_MS / 1000)}`); }
-function clearCookie(res) { res.setHeader('Set-Cookie', 'sid=; HttpOnly; Path=/; Max-Age=0'); }
+function setCookie(res, tok) {
+  // 无条件 Secure（fail-closed）：后端 HTTPS 由 Cloudflare 边缘/反代终结，浏览器↔CF 恒为 https，
+  // 故 http 直连拿不到可用会话，杜绝明文嗅探会话；配合 CF「Always Use HTTPS」自动升级 http→https。
+  res.setHeader('Set-Cookie', `sid=${tok}; HttpOnly; Path=/; Max-Age=${Math.floor(SESSION_MS / 1000)}; SameSite=Lax; Secure`);
+}
+function clearCookie(res) { res.setHeader('Set-Cookie', 'sid=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax; Secure'); }
 function getCookie(req) { const c = req.headers.cookie || ''; const m = c.match(/(?:^|;\s*)sid=([^;]+)/); return m ? m[1] : null; }
 
 // ---------- 中间件 ----------
@@ -176,45 +237,64 @@ app.get(['/', '/login'], (req, res) => {
   if (s) { return res.redirect('/app'); }
   res.type('html').send(authPage());
 });
+// 验证码：错误次数上限，超限作废需重新获取（防 6 位枚举爆破）
+const CODE_MAX_TRIES = 5;
+// 校验验证码：count 为 true 时才一次性作废（成功即删）；否则仅校验（注册前保留供 /register 复用）
+function verifyCode(email, code, consume) {
+  const rec = emailCodes[email];
+  if (!rec || rec.exp < Date.now()) { if (rec) delete emailCodes[email]; return false; }
+  if (rec.tries >= CODE_MAX_TRIES) { delete emailCodes[email]; return false; }
+  if (rec.code !== code) { rec.tries++; if (rec.tries >= CODE_MAX_TRIES) delete emailCodes[email]; return false; }
+  if (consume) delete emailCodes[email]; // 一次一用
+  return true;
+}
 app.post('/send-code', async (req, res) => {
   const email = (req.body.email || '').trim().toLowerCase();
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.type('text/plain').send('邮箱格式不对');
+  const ip = req.ip || req.connection.remoteAddress || '';
+  if (rateLimited('sendcode|email|' + email, 1, 60 * 1000)) return res.type('text/plain').send('发送过于频繁，请稍后再试');
+  if (rateLimited('sendcode|ip|' + ip, 10, 15 * 60 * 1000)) return res.type('text/plain').send('操作过于频繁，请稍后再试');
   const rec = stmts.getUser.get(email);
-  if (rec && rec.status === 'banned') return res.type('text/plain').send('该账号已被封禁');
+  if (rec && rec.status === 'banned') return res.type('text/plain').send('发送失败，请检查邮箱'); // 不泄露封禁状态
   try { await sendCode(email); res.type('text/plain').send('验证码已发送，请查收邮箱'); }
   catch (e) { res.type('text/plain').send('发送失败，请检查邮件配置'); }
 });
-// 验证码登录：已注册→登录；未注册→返回 {register:true}，前端让设密码（code 保留给 /register）
+// 验证码登录：已注册→登录；未注册→返回 {register:true}，前端让设密码（code 保留给 /register 复用）
 app.post('/login-code', (req, res) => {
   const email = (req.body.email || '').trim().toLowerCase(), code = (req.body.code || '').trim();
-  const rec = emailCodes[email];
-  if (!rec || rec.exp < Date.now() || rec.code !== code) return res.type('text/plain').send('验证码错误或已过期');
+  const ip = req.ip || req.connection.remoteAddress || '';
+  if (rateLimited('logincode|' + email + '|' + ip, 10, 5 * 60 * 1000)) return res.type('text/plain').send('尝试过于频繁，请稍后再试');
   let u = stmts.getUser.get(email);
-  if (!u) return res.json({ register: true });
-  delete emailCodes[email];
-  if (email === ADMIN_EMAIL && u.role !== 'admin') { stmts.setRole.run('admin', email); u = stmts.getUser.get(email); }
+  if (!u) {
+    // 未注册：仅校验验证码（计数防爆破），成功后保留 code 供 /register
+    if (!verifyCode(email, code, false)) return res.type('text/plain').send('验证码错误或已过期');
+    return res.json({ register: true });
+  }
+  if (!verifyCode(email, code, true)) return res.type('text/plain').send('验证码错误或已过期');
   if (u.status === 'banned') return res.type('text/plain').send('该账号已被封禁');
   setCookie(res, createSession(email)); res.redirect('/app');
 });
 // 注册（验证码登录的新账号 + 设置密码）
 app.post('/register', (req, res) => {
   const email = (req.body.email || '').trim().toLowerCase(), code = (req.body.code || '').trim(), password = (req.body.password || '').trim();
-  const rec = emailCodes[email];
-  if (!rec || rec.exp < Date.now() || rec.code !== code) return res.type('text/plain').send('验证码错误或已过期');
+  const ip = req.ip || req.connection.remoteAddress || '';
+  if (rateLimited('register|' + email + '|' + ip, 10, 5 * 60 * 1000)) return res.type('text/plain').send('尝试过于频繁，请稍后再试');
+  if (!verifyCode(email, code, true)) return res.type('text/plain').send('验证码错误或已过期');
   if (password.length < 6) return res.type('text/plain').send('密码至少 6 位');
-  delete emailCodes[email];
   stmts.insUser.run(email, Date.now(), email === ADMIN_EMAIL ? 'admin' : 'user');
   stmts.setPassword.run(hashPw(password), email);
   setCookie(res, createSession(email)); res.redirect('/app');
 });
-// 密码登录
+// 密码登录（统一错误提示，防账号枚举；限流防爆破）
 app.post('/login-password', (req, res) => {
   const email = (req.body.email || '').trim().toLowerCase(), password = (req.body.password || '');
+  const ip = req.ip || req.connection.remoteAddress || '';
+  if (rateLimited('loginpw|' + email + '|' + ip, 6, 15 * 60 * 1000)) return res.type('text/plain').send('尝试过于频繁，请稍后再试');
+  if (!email || !password) return res.type('text/plain').send('邮箱或密码错误');
   const u = stmts.getUser.get(email);
-  if (!u) return res.type('text/plain').send('账号不存在，请用验证码登录');
-  if (u.status === 'banned') return res.type('text/plain').send('该账号已被封禁');
-  if (!u.password_hash) return res.type('text/plain').send('该账号未设密码，请用验证码登录');
-  if (!verifyPw(password, u.password_hash)) return res.type('text/plain').send('密码错误');
+  if (!u || u.status === 'banned' || !u.password_hash || !verifyPw(password, u.password_hash)) {
+    return res.type('text/plain').send('邮箱或密码错误');
+  }
   setCookie(res, createSession(email)); res.redirect('/app');
 });
 app.get('/logout', (req, res) => { clearCookie(res); res.redirect('/'); });
@@ -225,6 +305,8 @@ app.get('/logout', (req, res) => { clearCookie(res); res.redirect('/'); });
 app.get('/api/pdd/callback', pddCallback);
 app.post('/api/pdd/callback', pddCallback);
 function pddCallback(req, res) {
+  const ip = req.ip || req.connection.remoteAddress || '';
+  if (rateLimited('pdccb|' + ip, 20, 60 * 1000)) return res.status(429).type('text/plain').send('429 请求过于频繁');
   const q = req.query || {}, b = (typeof req.body === 'object' ? req.body : {});
   const code = (q.code || b.code || '').toString();
   const state = (q.state || b.state || '').toString();
@@ -677,12 +759,13 @@ app.get('/app/settings', requireUser, (req, res) => {
 app.get('/admin', requireAdmin, (req, res) => {
   const n = stmts.countUsers.get().n;
   const rows = stmts.listUsers.all().map(r => ({ email: r.email, created: new Date(r.created * 1000).toLocaleString('zh-CN'), role: r.role, status: r.status, super: r.email === ADMIN_EMAIL }));
-  const trs = rows.map(u => `<tr class="border-b border-gray-100">
-    <td class="py-2 px-2">${u.email}</td><td class="py-2 px-2 text-gray-500 text-sm">${u.created}</td>
-    <td class="py-2 px-2 ${u.role === 'admin' ? 'text-red-600' : 'text-green-600'}">${u.role}${u.super ? ' ⭐' : ''}</td>
-    <td class="py-2 px-2">${u.status}</td>
-    <td class="py-2 px-2 text-xs">${u.super ? '—' : `<button class="btn" data-em="${u.email}" data-a="role">角色</button> <button class="btn" data-em="${u.email}" data-a="${u.status === 'banned' ? 'unban' : 'ban'}">${u.status === 'banned' ? '解封' : '封禁'}</button> <button class="btn text-red-500" data-em="${u.email}" data-a="delete">删除</button>`}</td>
-  </tr>`).join('');
+  const trs = rows.map(u => { const em = escapeHtml(u.email), st = escapeHtml(u.status), role = escapeHtml(u.role), cr = escapeHtml(u.created);
+    return `<tr class="border-b border-gray-100">
+    <td class="py-2 px-2">${em}</td><td class="py-2 px-2 text-gray-500 text-sm">${cr}</td>
+    <td class="py-2 px-2 ${u.role === 'admin' ? 'text-red-600' : 'text-green-600'}">${role}${u.super ? ' ⭐' : ''}</td>
+    <td class="py-2 px-2">${st}</td>
+    <td class="py-2 px-2 text-xs">${u.super ? '—' : `<button class="btn" data-em="${em}" data-a="role">角色</button> <button class="btn" data-em="${em}" data-a="${u.status === 'banned' ? 'unban' : 'ban'}">${u.status === 'banned' ? '解封' : '封禁'}</button> <button class="btn text-red-500" data-em="${em}" data-a="delete">删除</button>`}</td>
+  </tr>`; }).join('');
   res.type('html').send(layout({ title: '管理后台', userEmail: req.user.email, role: req.user.role, active: 'admin', content: `
     <div class="flex items-center justify-between mb-6"><h1 class="text-2xl font-bold">管理后台</h1>
       <a href="/admin/monitor" class="text-sm text-blue-600">📈 网站监控</a></div>
