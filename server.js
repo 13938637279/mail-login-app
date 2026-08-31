@@ -80,17 +80,24 @@ function authPage(msg, err) {
     ${m}
     <label class="text-sm text-gray-600 block mb-1 mt-4">邮箱</label>
     <div class="flex gap-2"><input id="email" type="email" placeholder="you@example.com" class="flex-1 border rounded-lg px-3 py-2 text-sm">
-      <button onclick="send()" class="bg-blue-500 text-white rounded-lg px-3 text-sm">获取验证码</button></div>
+      <button id="sendBtn" onclick="send()" class="bg-blue-500 text-white rounded-lg px-3 text-sm">获取验证码</button></div>
     <label class="text-sm text-gray-600 block mb-1 mt-3">验证码</label>
     <input id="code" type="text" placeholder="6 位验证码" class="w-full border rounded-lg px-3 py-2 text-sm">
     <button onclick="login()" class="w-full bg-blue-600 text-white rounded-lg py-2.5 mt-5 text-sm">登录</button>
     <p id="hint" class="text-sm mt-3"></p>
   </div>
   <script>
-  async function send(){const em=document.getElementById('email').value,h=document.getElementById('hint');
+  let cd=0;
+  async function send(){const em=document.getElementById('email').value,h=document.getElementById('hint'),btn=document.getElementById('sendBtn');
     if(!em||!em.includes('@')){h.textContent='请输入正确邮箱';h.className='text-sm mt-3 text-red-600';return}
-    h.textContent='发送中...';h.className='text-sm mt-3';const r=await fetch('/send-code',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'email='+encodeURIComponent(em)});
-    const t=await r.text();h.textContent=t;h.className='text-sm mt-3 '+(r.ok?'text-green-600':'text-red-600');}
+    btn.disabled=true;btn.style.opacity='0.5';btn.classList.add('bg-gray-300');btn.classList.remove('bg-blue-500');btn.textContent='发送中...';
+    h.textContent='发送中...';h.className='text-sm mt-3';
+    const r=await fetch('/send-code',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'email='+encodeURIComponent(em)});
+    const t=await r.text();h.textContent=t;h.className='text-sm mt-3 '+(r.ok?'text-green-600':'text-red-600');
+    if(t.indexOf('已发送')>=0){
+      cd=60;btn.textContent=cd+'s';
+      const iv=setInterval(()=>{btn.textContent=(--cd)+'s';if(cd<=0){clearInterval(iv);btn.disabled=false;btn.style.opacity='1';btn.classList.add('bg-blue-500');btn.classList.remove('bg-gray-300');btn.textContent='重发';}},1000);
+    }else{btn.disabled=false;btn.style.opacity='1';btn.classList.remove('bg-gray-300');btn.classList.add('bg-blue-500');btn.textContent='获取验证码';}}
   async function login(){const em=document.getElementById('email').value,c=document.getElementById('code').value,h=document.getElementById('hint');
     const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'email='+encodeURIComponent(em)+'&code='+encodeURIComponent(c)});
     if(r.redirected){location.href=r.url}else{const t=await r.text();h.textContent=t;h.className='text-sm mt-3 text-red-600';}}
@@ -155,9 +162,7 @@ app.get('/app', requireUser, (req, res) => {
 });
 const USER_MODULES = {
   profile:   ['个人资料', '登录账号与个人资料管理'],
-  favorites: ['我的收藏', '收藏的商品，可批量加入监控'],
   links:     ['我的链接', '收藏的链接'],
-  data:      ['我的数据', '价格曲线与监控统计'],
   settings:  ['设置', '站点偏好与监控上限'],
 };
 Object.entries(USER_MODULES).forEach(([key, [t, d]]) => {
@@ -301,6 +306,78 @@ app.get('/app/monitor', requireUser, (req, res) => {
     async monitor(r){ const resp=await fetch('/api/monitor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({platform:r.platform,sku:r.sku})}); const d=await resp.json(); if(d&&d.error){alert(d.error)} r.monitored=true; this.loadMonitors(); },
     async unmonitor(m){ await fetch('/api/unmonitor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({platform:m.platform,sku:m.sku})}); this.loadMonitors(); },
     async loadMonitors(){ const r=await fetch('/api/monitors'); const d=await r.json(); this.monitors=d.items; },
+  } };
+  </script>` });
+  res.type('html').send(s);
+});
+
+// —— 价格点（仅允许查看自己监控/收藏的商品）——
+app.get('/api/price-points', requireUser, (req, res) => {
+  const id = Number(req.query.product_id);
+  if (!id) return res.json({ points: [] });
+  if (!p2.isMonitor.get(req.user.email, id) && !p2.isFavorite.get(req.user.email, id)) return res.status(403).json({ points: [] });
+  const points = p2.listPricePoints.all(id).map(r => ({ date: r.date, price: r.price, status: r.status }));
+  res.json({ points });
+});
+
+// —— 我的收藏 页面（批量加监控，至多5个）——
+app.get('/app/favorites', requireUser, (req, res) => {
+  const s = layout({ title: '我的收藏', userEmail: req.user.email, role: req.user.role, active: 'favorites', content: `
+  <div x-data="favApp()" x-init="init()">
+    <h1 class="text-2xl font-bold mb-2">我的收藏</h1>
+    <p class="text-gray-500 mb-4">勾选收藏的商品，批量加入监控（至多 5 个）。</p>
+    <div class="flex items-center justify-between mb-3">
+      <span class="text-sm text-gray-500" x-text="'已选 ' + sel.length + '/5'"></span>
+      <button @click="batch()" class="bg-blue-600 text-white rounded-lg px-4 py-2 text-sm">批量加入监控</button>
+    </div>
+    <p x-show="msg" x-text="msg" class="text-sm text-green-600 mb-3"></p>
+    <template x-for="f in favs" :key="f.id">
+      <div class="bg-white border border-gray-100 rounded-xl p-3 mb-2 flex items-center gap-3">
+        <input type="checkbox" @change="toggle($event, f)">
+        <div class="flex-1">
+          <div class="font-medium text-sm" x-text="f.title"></div>
+          <div class="text-xs text-gray-400">来源 <span x-text="f.platform"></span> · 最新 <span x-text="f.last_price!=null ? '¥'+f.last_price : '—'"></span></div>
+        </div>
+        <button @click="unfav(f)" class="text-xs text-red-500">移除</button>
+      </div>
+    </template>
+    <p x-show="favs.length===0" class="text-gray-400 text-sm">还没有收藏。到「我的商品监控」搜索并点「收藏」。</p>
+  </div>
+  <script>
+  window.favApp = function(){ return {
+    favs:[], sel:[], msg:'',
+    init(){ this.load(); },
+    async load(){ const r=await fetch('/api/favorites'); this.favs=(await r.json()).items; },
+    toggle(e,f){ if(e.target.checked){ if(this.sel.length>=5){ e.target.checked=false; alert('至多选 5 个'); return; } this.sel.push({platform:f.platform, sku:f.sku}); } else { this.sel=this.sel.filter(x=>!(x.platform===f.platform&&x.sku===f.sku)); } },
+    async batch(){ if(!this.sel.length){ this.msg='请先勾选商品'; return; }
+      const r=await fetch('/api/monitor/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:this.sel})});
+      const d=await r.json(); this.msg='新增 '+d.added+' 个，已在监控 '+d.dup+' 个，跳过 '+d.skipped+' 个'; this.sel=[]; document.querySelectorAll('input[type=checkbox]').forEach(c=>c.checked=false); },
+    async unfav(f){ await fetch('/api/unfavorite',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({platform:f.platform,sku:f.sku})}); this.load(); },
+  } };
+  </script>` });
+  res.type('html').send(s);
+});
+
+// —— 我的数据 页面（价格曲线）——
+app.get('/app/data', requireUser, (req, res) => {
+  const s = layout({ title: '我的数据', userEmail: req.user.email, role: req.user.role, active: 'data', content: `
+  <div x-data="dataApp()" x-init="init()">
+    <h1 class="text-2xl font-bold mb-2">我的数据</h1>
+    <p class="text-gray-500 mb-4">选择一个监控中的商品，查看价格走势（近 30 天）。</p>
+    <select x-model="pid" @change="load()" class="border rounded-lg px-3 py-2 text-sm mb-4">
+      <option value="">-- 选择监控商品 --</option>
+      <template x-for="m in monitors" :key="m.id"><option :value="m.id" x-text="m.title"></option></template>
+    </select>
+    <div id="chart-box" class="bg-white border border-gray-100 rounded-xl p-4"></div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
+  <script>
+  window.dataApp = function(){ return {
+    monitors:[], pid:'',
+    async init(){ const r=await fetch('/api/monitors'); this.monitors=(await r.json()).items; if(this.monitors.length){ this.pid=this.monitors[0].id; this.load(); } },
+    async load(){ if(!this.pid) return; const r=await fetch('/api/price-points?product_id='+this.pid); const d=await r.json();
+      const dates=d.points.map(p=>p.date), vals=d.points.map(p=>p.price);
+      new ApexCharts(document.querySelector('#chart-box'),{ chart:{type:'line',height:300}, series:[{name:'价格',data:vals}], xaxis:{categories:dates}, stroke:{curve:'smooth'}, colors:['#3b82f6'] }).render(); },
   } };
   </script>` });
   res.type('html').send(s);
