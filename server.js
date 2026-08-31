@@ -69,7 +69,22 @@ function requireAdmin(req, res, next) {
   req.user = u; next();
 }
 
-// ---------- 登录页 ----------
+// ---------- 密码哈希（scrypt） ----------
+function hashPw(pw) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const h = crypto.scryptSync(String(pw), salt, 32).toString('hex');
+  return salt + ':' + h;
+}
+function verifyPw(pw, stored) {
+  if (!stored || stored.indexOf(':') < 0) return false;
+  const [salt, h] = stored.split(':');
+  try {
+    const calc = crypto.scryptSync(String(pw), salt, 32).toString('hex');
+    return calc.length === h.length && crypto.timingSafeEqual(Buffer.from(calc), Buffer.from(h));
+  } catch (e) { return false; }
+}
+
+// ---------- 登录页（密码 / 验证码 二选一） ----------
 function authPage(msg, err) {
   const m = msg ? `<div class="text-green-600 text-sm mt-3">${msg}</div>` : err ? `<div class="text-red-600 text-sm mt-3">${err}</div>` : '';
   return `<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -77,38 +92,88 @@ function authPage(msg, err) {
   <body class="bg-gray-50 min-h-screen flex items-center justify-center">
   <div class="bg-white p-8 rounded-2xl shadow-sm w-full max-w-sm">
     <h1 class="text-xl font-bold">wuchenyun.top</h1>
-    <h2 class="text-gray-500 text-sm mb-6">邮箱验证码登录</h2>
+    <h2 class="text-gray-500 text-sm mb-6">登录</h2>
     ${m}
-    <label class="text-sm text-gray-600 block mb-1 mt-4">邮箱</label>
-    <div class="flex gap-2"><input id="email" type="email" placeholder="you@example.com" class="flex-1 border rounded-lg px-3 py-2 text-sm">
-      <button id="sendBtn" onclick="send()" class="bg-blue-500 text-white rounded-lg px-3 text-sm">获取验证码</button></div>
-    <label class="text-sm text-gray-600 block mb-1 mt-3">验证码</label>
-    <input id="code" type="text" placeholder="6 位验证码" class="w-full border rounded-lg px-3 py-2 text-sm">
-    <button onclick="login()" class="w-full bg-blue-600 text-white rounded-lg py-2.5 mt-5 text-sm">登录</button>
+    <div class="flex gap-2 mb-5">
+      <button id="tabCode" onclick="tab('code')" class="flex-1 py-2 text-sm rounded-lg bg-blue-50 text-blue-600 font-semibold">验证码登录</button>
+      <button id="tabPwd" onclick="tab('pwd')" class="flex-1 py-2 text-sm rounded-lg text-gray-500">密码登录</button>
+    </div>
+
+    <!-- 验证码登录 -->
+    <div id="panelCode">
+      <label class="text-sm text-gray-600 block mb-1">邮箱</label>
+      <div class="flex gap-2 mb-3"><input id="email" type="email" placeholder="you@example.com" class="flex-1 border rounded-lg px-3 py-2 text-sm">
+        <button id="sendBtn" onclick="send()" class="bg-blue-500 text-white rounded-lg px-3 text-sm">获取验证码</button></div>
+      <label class="text-sm text-gray-600 block mb-1">验证码</label>
+      <input id="code" type="text" placeholder="6 位验证码" class="w-full border rounded-lg px-3 py-2 text-sm">
+      <div id="regBox" style="display:none;margin-top:12px">
+        <label class="text-sm text-gray-600 block mb-1">设置密码（新账号）</label>
+        <input id="pw1" type="password" placeholder="密码" class="w-full border rounded-lg px-3 py-2 text-sm mb-2">
+        <input id="pw2" type="password" placeholder="确认密码" class="w-full border rounded-lg px-3 py-2 text-sm">
+      </div>
+      <button id="codeLoginBtn" onclick="codeBtn()" class="w-full bg-blue-600 text-white rounded-lg py-2.5 mt-4 text-sm">登录</button>
+    </div>
+
+    <!-- 密码登录 -->
+    <div id="panelPwd" style="display:none">
+      <label class="text-sm text-gray-600 block mb-1">邮箱</label>
+      <input id="pemail" type="email" placeholder="you@example.com" class="w-full border rounded-lg px-3 py-2 text-sm">
+      <label class="text-sm text-gray-600 block mb-1 mt-3">密码</label>
+      <input id="ppwd" type="password" placeholder="密码" class="w-full border rounded-lg px-3 py-2 text-sm">
+      <button onclick="loginPwd()" class="w-full bg-blue-600 text-white rounded-lg py-2.5 mt-4 text-sm">登录</button>
+    </div>
+
     <p id="hint" class="text-sm mt-3"></p>
   </div>
   <script>
-  let cd=0;
+  let cd=0, needReg=false;
+  function tab(m){
+    document.getElementById('tabCode').className = 'flex-1 py-2 text-sm rounded-lg ' + (m==='code'?'bg-blue-50 text-blue-600 font-semibold':'text-gray-500');
+    document.getElementById('tabPwd').className = 'flex-1 py-2 text-sm rounded-lg ' + (m==='pwd'?'bg-blue-50 text-blue-600 font-semibold':'text-gray-500');
+    document.getElementById('panelCode').style.display = m==='code'?'':'none';
+    document.getElementById('panelPwd').style.display = m==='pwd'?'':'none';
+  }
+  function hint(t, ok){ const h=document.getElementById('hint'); h.textContent=t; h.className='text-sm mt-3 '+(ok?'text-green-600':'text-red-600'); }
   async function send(){const em=document.getElementById('email').value,h=document.getElementById('hint'),btn=document.getElementById('sendBtn');
-    if(!em||!em.includes('@')){h.textContent='请输入正确邮箱';h.className='text-sm mt-3 text-red-600';return}
+    if(!em||!em.includes('@')){hint('请输入正确邮箱',false);return}
     btn.disabled=true;btn.style.opacity='0.5';btn.classList.add('bg-gray-300');btn.classList.remove('bg-blue-500');btn.textContent='发送中...';
-    h.textContent='发送中...';h.className='text-sm mt-3';
     const r=await fetch('/send-code',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'email='+encodeURIComponent(em)});
-    const t=await r.text();h.textContent=t;h.className='text-sm mt-3 '+(r.ok?'text-green-600':'text-red-600');
-    if(t.indexOf('已发送')>=0){
-      cd=60;btn.textContent=cd+'s';
+    const t=await r.text();hint(t, r.ok);
+    if(t.indexOf('已发送')>=0){ cd=60;btn.textContent=cd+'s';
       const iv=setInterval(()=>{btn.textContent=(--cd)+'s';if(cd<=0){clearInterval(iv);btn.disabled=false;btn.style.opacity='1';btn.classList.add('bg-blue-500');btn.classList.remove('bg-gray-300');btn.textContent='重发';}},1000);
     }else{btn.disabled=false;btn.style.opacity='1';btn.classList.remove('bg-gray-300');btn.classList.add('bg-blue-500');btn.textContent='获取验证码';}}
-  async function login(){const em=document.getElementById('email').value,c=document.getElementById('code').value,h=document.getElementById('hint');
-    const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'email='+encodeURIComponent(em)+'&code='+encodeURIComponent(c)});
-    if(r.redirected){location.href=r.url}else{const t=await r.text();h.textContent=t;h.className='text-sm mt-3 text-red-600';}}
+  async function codeBtn(){ if(needReg){ doRegister(); } else { loginCode(); } }
+  async function loginCode(){
+    const em=document.getElementById('email').value, c=document.getElementById('code').value;
+    const r=await fetch('/login-code',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'email='+encodeURIComponent(em)+'&code='+encodeURIComponent(c)});
+    if(r.redirected){ location.href=r.url; return; }
+    let d; try{ d=await r.json(); }catch(e){ d = {}; }
+    if(d && d.register){ needReg=true; document.getElementById('regBox').style.display='block';
+      document.getElementById('codeLoginBtn').textContent='完成注册'; hint('新账号：请设置密码后点“完成注册”。', false); return; }
+    const t = await r.text(); hint(t, false);
+  }
+  async function doRegister(){
+    const em=document.getElementById('email').value, c=document.getElementById('code').value,
+      p1=document.getElementById('pw1').value, p2=document.getElementById('pw2').value;
+    if(p1.length<6){ hint('密码至少 6 位。', false); return; }
+    if(p1!==p2){ hint('两次密码不一致。', false); return; }
+    const r=await fetch('/register',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'email='+encodeURIComponent(em)+'&code='+encodeURIComponent(c)+'&password='+encodeURIComponent(p1)});
+    if(r.redirected){ location.href=r.url; return; }
+    const t=await r.text(); hint(t, false);
+  }
+  async function loginPwd(){
+    const em=document.getElementById('pemail').value, pp=document.getElementById('ppwd').value;
+    const r=await fetch('/login-password',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'email='+encodeURIComponent(em)+'&password='+encodeURIComponent(pp)});
+    if(r.redirected){ location.href=r.url; return; }
+    const t=await r.text(); hint(t, false);
+  }
   </script></body></html>`;
 }
 
 // ---------- 认证路由 ----------
 app.get(['/', '/login'], (req, res) => {
   const s = getSession(req);
-  if (s) { const u = stmts.getUser.get(s.email); return res.redirect(u && u.role === 'admin' ? '/admin' : '/app'); }
+  if (s) { return res.redirect('/app'); }
   res.type('html').send(authPage());
 });
 app.post('/send-code', async (req, res) => {
@@ -119,18 +184,38 @@ app.post('/send-code', async (req, res) => {
   try { await sendCode(email); res.type('text/plain').send('验证码已发送，请查收邮箱'); }
   catch (e) { res.type('text/plain').send('发送失败，请检查邮件配置'); }
 });
-app.post('/login', (req, res) => {
+// 验证码登录：已注册→登录；未注册→返回 {register:true}，前端让设密码（code 保留给 /register）
+app.post('/login-code', (req, res) => {
   const email = (req.body.email || '').trim().toLowerCase(), code = (req.body.code || '').trim();
   const rec = emailCodes[email];
   if (!rec || rec.exp < Date.now() || rec.code !== code) return res.type('text/plain').send('验证码错误或已过期');
-  delete emailCodes[email];
   let u = stmts.getUser.get(email);
-  if (!u) { stmts.insUser.run(email, Date.now(), email === ADMIN_EMAIL ? 'admin' : 'user'); u = stmts.getUser.get(email); }
-  else if (email === ADMIN_EMAIL && u.role !== 'admin') { stmts.setRole.run('admin', email); u = stmts.getUser.get(email); }
-  if (!u) return res.type('text/plain').send('注册失败，请重试');
+  if (!u) return res.json({ register: true });
+  delete emailCodes[email];
+  if (email === ADMIN_EMAIL && u.role !== 'admin') { stmts.setRole.run('admin', email); u = stmts.getUser.get(email); }
   if (u.status === 'banned') return res.type('text/plain').send('该账号已被封禁');
-  setCookie(res, createSession(email));
-  res.redirect('/app');
+  setCookie(res, createSession(email)); res.redirect('/app');
+});
+// 注册（验证码登录的新账号 + 设置密码）
+app.post('/register', (req, res) => {
+  const email = (req.body.email || '').trim().toLowerCase(), code = (req.body.code || '').trim(), password = (req.body.password || '').trim();
+  const rec = emailCodes[email];
+  if (!rec || rec.exp < Date.now() || rec.code !== code) return res.type('text/plain').send('验证码错误或已过期');
+  if (password.length < 6) return res.type('text/plain').send('密码至少 6 位');
+  delete emailCodes[email];
+  stmts.insUser.run(email, Date.now(), email === ADMIN_EMAIL ? 'admin' : 'user');
+  stmts.setPassword.run(hashPw(password), email);
+  setCookie(res, createSession(email)); res.redirect('/app');
+});
+// 密码登录
+app.post('/login-password', (req, res) => {
+  const email = (req.body.email || '').trim().toLowerCase(), password = (req.body.password || '');
+  const u = stmts.getUser.get(email);
+  if (!u) return res.type('text/plain').send('账号不存在，请用验证码登录');
+  if (u.status === 'banned') return res.type('text/plain').send('该账号已被封禁');
+  if (!u.password_hash) return res.type('text/plain').send('该账号未设密码，请用验证码登录');
+  if (!verifyPw(password, u.password_hash)) return res.type('text/plain').send('密码错误');
+  setCookie(res, createSession(email)); res.redirect('/app');
 });
 app.get('/logout', (req, res) => { clearCookie(res); res.redirect('/'); });
 
@@ -492,7 +577,16 @@ app.get('/api/profile', requireUser, (req, res) => {
   const u = stmts.getUser.get(req.user.email);
   let prof = p2.getProfile.get(req.user.email);
   if (!prof) { p2.upsertProfile.run(req.user.email, '', 1, Date.now()); prof = p2.getProfile.get(req.user.email); }
-  res.json({ email: u.email, created: u.created, role: u.role, status: u.status, nickname: prof.nickname || '', alert_enabled: prof.alert_enabled });
+  res.json({ email: u.email, created: u.created, role: u.role, status: u.status, nickname: prof.nickname || '', alert_enabled: prof.alert_enabled, password_set: !!u.password_hash });
+});
+app.post('/api/password', requireUser, (req, res) => {
+  const u = stmts.getUser.get(req.user.email);
+  const current = req.body.current || '';
+  const password = (req.body.password || '').trim();
+  if (password.length < 6) return res.status(400).json({ ok: false, error: '密码至少 6 位' });
+  if (u.password_hash && !verifyPw(current, u.password_hash)) return res.status(400).json({ ok: false, error: '当前密码错误' });
+  stmts.setPassword.run(hashPw(password), req.user.email);
+  res.json({ ok: true });
 });
 app.post('/api/profile', requireUser, (req, res) => {
   const nickname = (req.body.nickname || '').slice(0, 50);
@@ -524,13 +618,33 @@ app.get('/app/profile', requireUser, (req, res) => {
         <p x-show="msg" x-text="msg" class="text-sm text-green-600"></p>
       </div>
     </div>
+
+    <div class="bg-white border border-gray-100 rounded-xl p-6 max-w-xl mt-6">
+      <h2 class="text-lg font-semibold mb-3">设置密码</h2>
+      <div class="space-y-3">
+        <div x-show="password_set">
+          <div class="text-sm text-gray-500 mb-1">当前密码</div>
+          <input type="password" x-model="cur" class="w-full border rounded-lg px-3 py-2 text-sm">
+        </div>
+        <div><div class="text-sm text-gray-500 mb-1">新密码</div><input type="password" x-model="pw1" class="w-full border rounded-lg px-3 py-2 text-sm"></div>
+        <div><div class="text-sm text-gray-500 mb-1">确认新密码</div><input type="password" x-model="pw2" class="w-full border rounded-lg px-3 py-2 text-sm"></div>
+        <button @click="setPw()" class="bg-blue-600 text-white rounded-lg px-4 py-2 text-sm w-fit">保存密码</button>
+        <p x-show="pmsg" x-text="pmsg" class="text-sm" :class="perr?'text-red-600':'text-green-600'"></p>
+      </div>
+    </div>
   </div>
   <script>
   window.profApp = function(){ return {
-    email:'', role:'', status:'', nickname:'', alert_enabled:1, msg:'',
+    email:'', role:'', status:'', nickname:'', alert_enabled:1, msg:'', password_set:false, cur:'', pw1:'', pw2:'', pmsg:'', perr:false,
     async init(){ const r=await fetch('/api/profile'); const d=await r.json();
-      this.email=d.email; this.role=d.role; this.status=d.status; this.nickname=d.nickname; this.alert_enabled=d.alert_enabled; },
+      this.email=d.email; this.role=d.role; this.status=d.status; this.nickname=d.nickname; this.alert_enabled=d.alert_enabled; this.password_set=d.password_set; },
     async save(){ await fetch('/api/profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nickname:this.nickname,alert_enabled:this.alert_enabled?1:0})}); this.msg='已保存'; },
+    async setPw(){ if(this.pw1.length<6){ this.pmsg='密码至少 6 位'; this.perr=true; return; }
+      if(this.pw1!==this.pw2){ this.pmsg='两次密码不一致'; this.perr=true; return; }
+      const r=await fetch('/api/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current:this.cur,password:this.pw1})});
+      const d=await r.json();
+      if(d && d.ok){ this.pmsg='密码已更新'; this.perr=false; this.cur=''; this.pw1=''; this.pw2=''; this.password_set=true; }
+      else { this.pmsg=(d&&d.error)||'失败'; this.perr=true; } },
   } };
   </script>` });
   res.type('html').send(s);

@@ -20,11 +20,13 @@ if (hasOldSchema) {
   db.exec('DROP TABLE users_old');
 }
 db.exec("CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, created INTEGER NOT NULL, role TEXT NOT NULL DEFAULT 'user', status TEXT NOT NULL DEFAULT 'active')");
+try { db.exec('ALTER TABLE users ADD COLUMN password_hash TEXT'); } catch (e) {} // 幂等
 
 // —— 预编译常用语句 ——
 const stmts = {
   insUser:     db.prepare('INSERT OR IGNORE INTO users (email, created, role) VALUES (?, ?, ?)'),
-  getUser:     db.prepare('SELECT email, created, role, status FROM users WHERE email = ?'),
+  getUser:     db.prepare('SELECT email, created, role, status, password_hash FROM users WHERE email = ?'),
+  setPassword: db.prepare('UPDATE users SET password_hash = ? WHERE email = ?'),
   listUsers:   db.prepare('SELECT email, created, role, status FROM users ORDER BY created DESC'),
   setRole:     db.prepare('UPDATE users SET role = ? WHERE email = ?'),
   setStatus:   db.prepare('UPDATE users SET status = ? WHERE email = ?'),
