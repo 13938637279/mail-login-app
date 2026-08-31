@@ -77,6 +77,13 @@ db.exec(`CREATE TABLE IF NOT EXISTS crawl_jobs (
   attempts INTEGER DEFAULT 0,
   created_at INTEGER
 )`);
+// 平台 OAuth/回调 事件记录（如拼多多授权回调），与本站登录完全分开
+db.exec(`CREATE TABLE IF NOT EXISTS oauth_callbacks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  platform TEXT NOT NULL,
+  code TEXT, state TEXT, raw TEXT,
+  created_at INTEGER NOT NULL
+)`);
 
 const p2 = {
   upsertProduct: db.prepare(`INSERT INTO products (platform, sku, title, img, url, last_price, observed_at, status)
@@ -94,6 +101,7 @@ const p2 = {
       p.platform, p.sku, p.title, p.img, p.url, p.last_price, p.observed_at, p.status
       FROM monitors m JOIN products p ON p.id = m.product_id WHERE m.user_id = ? ORDER BY m.created_at DESC`),
   countMonitorsByUser: db.prepare('SELECT COUNT(*) AS n FROM monitors WHERE user_id = ?'),
+  addOauthCallback: db.prepare('INSERT INTO oauth_callbacks (platform, code, state, raw, created_at) VALUES (?, ?, ?, ?, ?)'),
   addFavorite: db.prepare('INSERT OR IGNORE INTO favorites (user_id, product_id, created_at) VALUES (?, ?, ?)'),
   removeFavorite: db.prepare('DELETE FROM favorites WHERE user_id = ? AND product_id = ?'),
   isFavorite:  db.prepare('SELECT id FROM favorites WHERE user_id = ? AND product_id = ?'),

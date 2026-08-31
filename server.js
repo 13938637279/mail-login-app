@@ -133,6 +133,32 @@ app.post('/login', (req, res) => {
 });
 app.get('/logout', (req, res) => { clearCookie(res); res.redirect('/'); });
 
+// ---------- 拼多多 OAuth/API 回调（独立于本站登录，public） ----------
+// PDD 授权/回调会带 code,state 等参数；本站只需接收、记录、返回成功页。
+// 与本站邮箱登录完全分开，不混用 session。
+app.get('/api/pdd/callback', pddCallback);
+app.post('/api/pdd/callback', pddCallback);
+function pddCallback(req, res) {
+  const q = req.query || {}, b = (typeof req.body === 'object' ? req.body : {});
+  const code = (q.code || b.code || '').toString();
+  const state = (q.state || b.state || '').toString();
+  const raw = JSON.stringify({ query: q, body: b });
+  try { p2.addOauthCallback.run('pdd', code.slice(0, 200), state.slice(0, 200), raw.slice(0, 4000), Date.now()); } catch (e) {}
+  // TODO(接入时)：1) 若开 CSRF，校验 state 是否匹配会话里存的随机器 2) 有 code 则用 client_id/secret 换 access_token
+  //             3) 查订单/商品信息等。以下为占位成功页。
+  const hasParams = code || state;
+  res.type('html').send(`<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>回调 · wuchenyun</title><script src="https://cdn.tailwindcss.com"></script></head>
+  <body class="bg-gray-50 min-h-screen flex items-center justify-center">
+  <div class="bg-white p-8 rounded-2xl shadow-sm w-full max-w-sm text-center">
+    <div class="text-3xl mb-2">${hasParams ? '✅' : '⚠️'}</div>
+    <h1 class="text-lg font-semibold">拼多多回调</h1>
+    <p class="text-sm text-gray-500 mt-2">${hasParams ? '已收到授权回调并记录。' : '未收到回调参数。'}</p>
+    <p class="text-xs text-gray-400 mt-4">code: ${code ? '已收到' : '无'} · state: ${state ? '已收到' : '无'}</p>
+    <a href="/" class="inline-block mt-5 text-sm text-blue-600">返回首页</a>
+  </div></body></html>`);
+}
+
 // ---------- 用户模块（P1 骨架页）----------
 function stubPage(active, title, desc, userEmail, role) {
   return layout({ title, userEmail, role, active, content: `
