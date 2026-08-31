@@ -1,35 +1,59 @@
 // adapters.js —— 取价适配器（多平台）
-// 每平台一个 adapter，统一 async search(keyword)。内部做「官方API优先 → 爬虫兜底」。
-// ⚠️ 当前为【演示源】返回样例数据，用于跑通 UI/流程。
-//    接真实平台：把对应 adapter 的 search() 换成真实 联盟API/爬虫 调用即可（接口不变）。
-//    真实取值需各平台开放平台/联盟 API 密钥；否则只能爬虫（这几家反爬强、有合规/被封风险）。
+// 每平台一个 adapter，统一 async search(keyword)。内部可做「官方API优先 → 爬虫兜底」。
+// 当前：pdd 用【官方多多进宝 API】；jd/taobao/douyin 为【演示源】(待接真实源)。
+const crypto = require('crypto');
 
-const PLATFORMS = { jd: '京东', taobao: '淘宝', pdd: '拼多多', douyin: '抖音商城' };
+// ---------- PDD 多多进宝（官方 API，签名调用） ----------
+// 需环境变量：PDD_CLIENT_ID / PDD_CLIENT_SECRET / PDD_PID
+async function pddRequest(api, params) {
+  const client_id = process.env.PDD_CLIENT_ID, secret = process.env.PDD_CLIENT_SECRET;
+  if (!client_id || !secret) return null;
+  const p = { type: api, client_id, timestamp: Date.now(), ...params };
+  const keys = Object.keys(p).sort();
+  let s = '';
+  for (const k of keys) s += k + p[k];
+  const sign = crypto.createHash('md5').update(secret + s + secret).digest('hex').toUpperCase();
+  p.sign = sign;
+  const body = new URLSearchParams(p).toString();
+  try {
+    const res = await fetch('https://gw-api.pinduoduo.com/api/router', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+    return await res.json();
+  } catch (e) { return null; }
+}
 
-// 样例商品目录（演示用）
+const ADAPTERS = {
+  pdd: {
+    name: '拼多多',
+    async search(kw) {
+      if (!process.env.PDD_CLIENT_ID || !process.env.PDD_PID) return []; // 未配置凭证
+      const data = await pddRequest('pdd.ddk.goods.search', { keyword: kw, pid: process.env.PDD_PID, page_size: 20 });
+      const list = data && data.goods_search_response ? (data.goods_search_response.goods_list || []) : [];
+      return list.map(g => ({
+        sku: String(g.goods_id),
+        title: g.goods_name,
+        price: (Number(g.min_group_price || g.min_normal_price) || 0) / 100, // 分为单位 → 元
+        img: g.goods_thumbnail_url || g.goods_image_url || '',
+        url: `https://mobile.yangkeduo.com/goods.html?goods_id=${g.goods_id}`,
+      }));
+    },
+  },
+};
+
+// ---------- 演示源：jd / taobao / douyin（待接真实源） ----------
 const SAMPLE = [
   { title: 'iPhone 15 128GB',    price: 4999 },
   { title: 'iPhone 15 Pro 256GB', price: 6999 },
   { title: 'AirPods Pro 2 USB-C', price: 1299 },
   { title: '华为 Mate 60 512GB',  price: 5999 },
 ];
-
-function slug(s) { return s.replace(/[^a-zA-Z0-9]+/g, '').slice(0, 10); }
-
-const ADAPTERS = {};
-for (const [key, name] of Object.entries(PLATFORMS)) {
+const slug = s => s.replace(/[^a-zA-Z0-9]+/g, '').slice(0, 10);
+for (const [key, name] of Object.entries({ jd: '京东', taobao: '淘宝', douyin: '抖音商城' })) {
   ADAPTERS[key] = {
     name,
     async search(kw) {
       const q = (kw || '').trim().toLowerCase();
       return SAMPLE.filter(p => !q || p.title.toLowerCase().includes(q))
-        .map(p => ({
-          sku: `${key}-${slug(p.title)}`,
-          title: `${p.title}（${name}）`,
-          price: Math.round(p.price * (0.9 + Math.random() * 0.2)), // 演示随机价
-          img: '',
-          url: `https://example.com/${key}/${slug(p.title)}`,
-        }));
+        .map(p => ({ sku: `${key}-${slug(p.title)}`, title: `${p.title}（${name}）`, price: Math.round(p.price * (0.9 + Math.random() * 0.2)), img: '', url: `https://example.com/${key}/${slug(p.title)}` }));
     },
   };
 }

@@ -13,5 +13,8 @@ services:
       - SMTP_USER=${SMTP_USER}
       - SMTP_PASS=${SMTP_PASS}
       - SMTP_FROM=${SMTP_FROM}
+      - PDD_CLIENT_ID=${PDD_CLIENT_ID}
+      - PDD_CLIENT_SECRET=${PDD_CLIENT_SECRET}
+      - PDD_PID=${PDD_PID}
     volumes:
       - ./data:/app/data
