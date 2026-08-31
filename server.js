@@ -246,7 +246,8 @@ function pddCallback(req, res) {
 }
 
 
-app.get('/app', requireUser, (req, res) => {
+// 工具选择首页（/app 与 /app/tools 共用）
+function appHome(req, res) {
   const cards = [
     { icon: '🛒', t: '我的商品监控', d: '多平台比价 + 每日报价 + 目标价提醒', href: '/app/monitor', live: true },
     { icon: '⭐', t: '我的收藏', d: '收藏商品 / 批量加入监控', href: '/app/favorites' },
@@ -259,12 +260,13 @@ app.get('/app', requireUser, (req, res) => {
     <div class="text-xs text-gray-500 mt-1">${c.d}</div>
     ${c.live ? '<span class="inline-block mt-2 text-[11px] bg-blue-50 text-blue-600 px-2 py-0.5 rounded">可用</span>' : '<span class="inline-block mt-2 text-[11px] bg-gray-100 text-gray-400 px-2 py-0.5 rounded">即将上线</span>'}
   </a>`).join('');
-  const s = layout({ title: '我的工具', userEmail: req.user.email, role: req.user.role, active: 'tools', content: `
+  res.type('html').send(layout({ title: '我的工具', userEmail: req.user.email, role: req.user.role, active: 'tools', content: `
     <h1 class="text-2xl font-bold mb-2">我的工具</h1>
     <p class="text-gray-500 mb-6">选择一个工具开始使用</p>
-    <div class="grid sm:grid-cols-2 gap-4">${body}</div>` });
-  res.type('html').send(s);
-});
+    <div class="grid sm:grid-cols-2 gap-4">${body}</div>` }));
+}
+app.get('/app', requireUser, appHome);
+app.get('/app/tools', requireUser, appHome);
 // （所有模块已有专属页面；USER_MODULES 骨架已全部替换）
 
 // ============ P2：比价/监控 ============
