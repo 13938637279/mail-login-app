@@ -93,6 +93,13 @@ db.exec(`CREATE TABLE IF NOT EXISTS alerts (
   price REAL, target_price REAL,
   created_at INTEGER NOT NULL
 )`);
+// 用户资料/偏好
+db.exec(`CREATE TABLE IF NOT EXISTS profiles (
+  user_id TEXT PRIMARY KEY,
+  nickname TEXT,
+  alert_enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL
+)`);
 
 const p2 = {
   upsertProduct: db.prepare(`INSERT INTO products (platform, sku, title, img, url, last_price, observed_at, status)
@@ -120,6 +127,9 @@ const p2 = {
   listAlertsByUser: db.prepare(`SELECT a.id, a.price, a.target_price, a.created_at, p.title, p.platform, p.url
       FROM alerts a JOIN products p ON p.id = a.product_id WHERE a.user_id = ? ORDER BY a.created_at DESC LIMIT 50`),
   addOauthCallback: db.prepare('INSERT INTO oauth_callbacks (platform, code, state, raw, created_at) VALUES (?, ?, ?, ?, ?)'),
+  getProfile: db.prepare('SELECT * FROM profiles WHERE user_id = ?'),
+  upsertProfile: db.prepare(`INSERT INTO profiles (user_id, nickname, alert_enabled, created_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET nickname = excluded.nickname, alert_enabled = excluded.alert_enabled`),
   addLink: db.prepare('INSERT INTO links (user_id, url, title, created_at) VALUES (?, ?, ?, ?)'),
   listLinks: db.prepare('SELECT * FROM links WHERE user_id = ? ORDER BY created_at DESC'),
   delLink: db.prepare('DELETE FROM links WHERE id = ? AND user_id = ?'),

@@ -160,13 +160,6 @@ function pddCallback(req, res) {
   </div></body></html>`);
 }
 
-// ---------- 用户模块（P1 骨架页）----------
-function stubPage(active, title, desc, userEmail, role) {
-  return layout({ title, userEmail, role, active, content: `
-    <h1 class="text-2xl font-bold mb-2">${title}</h1>
-    <p class="text-gray-500 mb-6">${desc}</p>
-    <div class="border-2 border-dashed border-gray-200 rounded-xl p-10 text-center text-gray-400 bg-white">功能建设中（P1 框架已就绪）</div>` });
-}
 
 app.get('/app', requireUser, (req, res) => {
   const cards = [
@@ -187,15 +180,7 @@ app.get('/app', requireUser, (req, res) => {
     <div class="grid sm:grid-cols-2 gap-4">${body}</div>` });
   res.type('html').send(s);
 });
-const USER_MODULES = {
-  profile:   ['个人资料', '登录账号与个人资料管理'],
-  settings:  ['设置', '站点偏好与监控上限'],
-};
-Object.entries(USER_MODULES).forEach(([key, [t, d]]) => {
-  app.get('/app/' + key, requireUser, (req, res) => {
-    res.type('html').send(stubPage(key, t, d, req.user.email, req.user.role));
-  });
-});
+// （所有模块已有专属页面；USER_MODULES 骨架已全部替换）
 
 // ============ P2：比价/监控 ============
 const MAX_MONITORS = Number(process.env.MAX_MONITORS || 50);
@@ -500,6 +485,76 @@ app.post('/_/cron/refresh-prices', async (req, res) => {
 app.get('/api/alerts', requireUser, (req, res) => {
   const items = p2.listAlertsByUser.all(req.user.email).map(r => ({ id: r.id, title: r.title, platform: r.platform, url: r.url, price: r.price, target_price: r.target_price, created_at: r.created_at }));
   res.json({ items });
+});
+
+// ---------- P5：个人资料 / 设置 ----------
+app.get('/api/profile', requireUser, (req, res) => {
+  const u = stmts.getUser.get(req.user.email);
+  let prof = p2.getProfile.get(req.user.email);
+  if (!prof) { p2.upsertProfile.run(req.user.email, '', 1, Date.now()); prof = p2.getProfile.get(req.user.email); }
+  res.json({ email: u.email, created: u.created, role: u.role, status: u.status, nickname: prof.nickname || '', alert_enabled: prof.alert_enabled });
+});
+app.post('/api/profile', requireUser, (req, res) => {
+  const nickname = (req.body.nickname || '').slice(0, 50);
+  const alert_enabled = (req.body.alert_enabled === 1 || req.body.alert_enabled === '1') ? 1 : 0;
+  const prof = p2.getProfile.get(req.user.email);
+  p2.upsertProfile.run(req.user.email, nickname, alert_enabled, prof ? prof.created_at : Date.now());
+  res.json({ ok: true });
+});
+
+app.get('/app/profile', requireUser, (req, res) => {
+  const s = layout({ title: '个人资料', userEmail: req.user.email, role: req.user.role, active: 'profile', content: `
+  <div x-data="profApp()" x-init="init()">
+    <h1 class="text-2xl font-bold mb-2">个人资料</h1>
+    <div class="bg-white border border-gray-100 rounded-xl p-6 max-w-xl">
+      <div class="grid gap-4">
+        <div><div class="text-sm text-gray-500">邮箱</div><div class="font-medium" x-text="email"></div></div>
+        <div class="grid grid-cols-2 gap-4">
+          <div><div class="text-sm text-gray-500">角色</div><div x-text="role"></div></div>
+          <div><div class="text-sm text-gray-500">状态</div><div x-text="status"></div></div>
+        </div>
+        <div>
+          <div class="text-sm text-gray-500 mb-1">昵称</div>
+          <input x-model="nickname" placeholder="设置昵称" class="w-full border rounded-lg px-3 py-2 text-sm">
+        </div>
+        <label class="flex items-center gap-2 text-sm">
+          <input type="checkbox" x-model="alert_enabled" :value="alert_enabled" checked="alert_enabled===1"> 开启目标价提醒
+        </label>
+        <button @click="save()" class="bg-blue-600 text-white rounded-lg px-4 py-2 text-sm w-fit">保存</button>
+        <p x-show="msg" x-text="msg" class="text-sm text-green-600"></p>
+      </div>
+    </div>
+  </div>
+  <script>
+  window.profApp = function(){ return {
+    email:'', role:'', status:'', nickname:'', alert_enabled:1, msg:'',
+    async init(){ const r=await fetch('/api/profile'); const d=await r.json();
+      this.email=d.email; this.role=d.role; this.status=d.status; this.nickname=d.nickname; this.alert_enabled=d.alert_enabled; },
+    async save(){ await fetch('/api/profile',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nickname:this.nickname,alert_enabled:this.alert_enabled?1:0})}); this.msg='已保存'; },
+  } };
+  </script>` });
+  res.type('html').send(s);
+});
+
+app.get('/app/settings', requireUser, (req, res) => {
+  const s = layout({ title: '设置', userEmail: req.user.email, role: req.user.role, active: 'settings', content: `
+  <div x-data="setApp()" x-init="init()">
+    <h1 class="text-2xl font-bold mb-2">设置</h1>
+    <div class="bg-white border border-gray-100 rounded-xl p-6 max-w-xl space-y-5">
+      <div class="flex justify-between items-center"><div>每用户监控上限</div><div class="text-sm text-gray-500">${MAX_MONITORS} 个</div></div>
+      <label class="flex items-center justify-between text-sm">
+        <span>目标价提醒（降幅提醒）</span>
+        <input type="checkbox" x-model="alert_enabled" :value="alert_enabled">
+      </label>
+      <div class="text-sm text-gray-400">提醒当前记录在页面（/app/data 与提醒接口），邮件/钉钉推送敬请期待。</div>
+    </div>
+  </div>
+  <script>
+  window.setApp = function(){ return { alert_enabled:1,
+    async init(){ const r=await fetch('/api/profile'); this.alert_enabled=(await r.json()).alert_enabled; },
+  } };
+  </script>` });
+  res.type('html').send(s);
 });
 
 // ---------- 管理员 ----------
