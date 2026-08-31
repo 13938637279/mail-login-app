@@ -32,4 +32,74 @@ const stmts = {
   countUsers:  db.prepare('SELECT COUNT(*) AS n FROM users'),
 };
 
-module.exports = { db, stmts };
+// ============ P2：比价/监控 相关表 ============
+db.exec(`CREATE TABLE IF NOT EXISTS products (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  platform TEXT NOT NULL,
+  sku TEXT NOT NULL,
+  title TEXT, img TEXT, url TEXT,
+  last_price REAL, observed_at INTEGER,
+  status TEXT NOT NULL DEFAULT 'fresh',
+  UNIQUE(platform, sku)
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS price_points (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  product_id INTEGER NOT NULL,
+  date TEXT NOT NULL,
+  price REAL,
+  status TEXT NOT NULL DEFAULT 'fresh',
+  UNIQUE(product_id, date)
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS monitors (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL,
+  product_id INTEGER NOT NULL,
+  target_price REAL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(user_id, product_id)
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS favorites (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL,
+  product_id INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE(user_id, product_id)
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS links (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL, url TEXT, title TEXT, created_at INTEGER
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS crawl_jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  product_id INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  scheduled_for INTEGER,
+  attempts INTEGER DEFAULT 0,
+  created_at INTEGER
+)`);
+
+const p2 = {
+  upsertProduct: db.prepare(`INSERT INTO products (platform, sku, title, img, url, last_price, observed_at, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(platform, sku) DO UPDATE SET title=excluded.title, img=excluded.img, url=excluded.url,
+      last_price=excluded.last_price, observed_at=excluded.observed_at, status=excluded.status`),
+  getProductBySku: db.prepare('SELECT * FROM products WHERE platform = ? AND sku = ?'),
+  getProductById:  db.prepare('SELECT * FROM products WHERE id = ?'),
+  insertPricePoint: db.prepare('INSERT OR REPLACE INTO price_points (product_id, date, price, status) VALUES (?, ?, ?, ?)'),
+  listPricePoints:  db.prepare('SELECT * FROM price_points WHERE product_id = ? ORDER BY date'),
+  addMonitor:  db.prepare('INSERT OR IGNORE INTO monitors (user_id, product_id, target_price, created_at) VALUES (?, ?, ?, ?)'),
+  removeMonitor: db.prepare('DELETE FROM monitors WHERE user_id = ? AND product_id = ?'),
+  isMonitor:   db.prepare('SELECT id FROM monitors WHERE user_id = ? AND product_id = ?'),
+  listMonitors: db.prepare(`SELECT m.id, m.product_id, m.target_price, m.created_at,
+      p.platform, p.sku, p.title, p.img, p.url, p.last_price, p.observed_at, p.status
+      FROM monitors m JOIN products p ON p.id = m.product_id WHERE m.user_id = ? ORDER BY m.created_at DESC`),
+  countMonitorsByUser: db.prepare('SELECT COUNT(*) AS n FROM monitors WHERE user_id = ?'),
+  addFavorite: db.prepare('INSERT OR IGNORE INTO favorites (user_id, product_id, created_at) VALUES (?, ?, ?)'),
+  removeFavorite: db.prepare('DELETE FROM favorites WHERE user_id = ? AND product_id = ?'),
+  isFavorite:  db.prepare('SELECT id FROM favorites WHERE user_id = ? AND product_id = ?'),
+  listFavorites: db.prepare(`SELECT f.id, f.product_id, f.created_at,
+      p.platform, p.sku, p.title, p.img, p.url, p.last_price, p.status
+      FROM favorites f JOIN products p ON p.id = f.product_id WHERE f.user_id = ? ORDER BY f.created_at DESC`),
+};
+
+module.exports = { db, stmts, p2 };

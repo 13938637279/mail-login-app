@@ -1,10 +1,10 @@
-// server.js —— wuchenyun.top 多模块平台 P1（Express + SQLite + 邮箱验证码登录）
+// server.js —— wuchenyun.top 多模块平台 P1/P2（Express + SQLite + 邮箱验证码登录）
 const express = require('express');
 const crypto = require('crypto');
-const path = require('path');
 const nodemailer = require('nodemailer');
-const { db, stmts } = require('./db');
+const { db, stmts, p2 } = require('./db');
 const { layout } = require('./layout');
+const { searchAll } = require('./adapters');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -155,7 +155,6 @@ app.get('/app', requireUser, (req, res) => {
 });
 const USER_MODULES = {
   profile:   ['个人资料', '登录账号与个人资料管理'],
-  monitor:   ['我的商品监控', '多平台比价、收藏、每日报价、目标价提醒'],
   favorites: ['我的收藏', '收藏的商品，可批量加入监控'],
   links:     ['我的链接', '收藏的链接'],
   data:      ['我的数据', '价格曲线与监控统计'],
@@ -165,6 +164,146 @@ Object.entries(USER_MODULES).forEach(([key, [t, d]]) => {
   app.get('/app/' + key, requireUser, (req, res) => {
     res.type('html').send(stubPage(key, t, d, req.user.email, req.user.role));
   });
+});
+
+// ============ P2：比价/监控 ============
+const MAX_MONITORS = Number(process.env.MAX_MONITORS || 50);
+function today() { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
+// 商品入库 + 记录一次“今日价”（演示源把搜索价当今日真实价）
+function ensureProduct(platform, sku, info, price) {
+  p2.upsertProduct.run(platform, sku, info.title, info.img || '', info.url || '', price, Date.now(), 'fresh');
+  const prod = p2.getProductBySku.get(platform, sku);
+  p2.insertPricePoint.run(prod.id, today(), price, 'fresh');
+  return prod;
+}
+
+// —— 搜索 ——
+app.get('/api/search', requireUser, async (req, res) => {
+  const q = (req.query.q || '').trim();
+  if (!q) return res.json({ results: [] });
+  const found = await searchAll(q);
+  const results = found.map(r => {
+    const prod = ensureProduct(r.platform, r.sku, r, r.price);
+    return { id: prod.id, platform: prod.platform, sku: prod.sku, title: prod.title, img: prod.img, url: prod.url,
+      price: prod.last_price, monitored: !!p2.isMonitor.get(req.user.email, prod.id), favorited: !!p2.isFavorite.get(req.user.email, prod.id) };
+  });
+  res.json({ results });
+});
+
+// —— 收藏 ——
+app.post('/api/favorite', requireUser, (req, res) => {
+  const prod = p2.getProductBySku.get(req.body.platform, req.body.sku);
+  if (!prod) return res.status(404).json({ ok: false, error: '商品不存在' });
+  p2.addFavorite.run(req.user.email, prod.id, Date.now());
+  res.json({ ok: true });
+});
+app.post('/api/unfavorite', requireUser, (req, res) => {
+  const prod = p2.getProductBySku.get(req.body.platform, req.body.sku);
+  if (prod) p2.removeFavorite.run(req.user.email, prod.id);
+  res.json({ ok: true });
+});
+
+// —— 监控 ——
+app.post('/api/monitor', requireUser, (req, res) => {
+  const prod = p2.getProductBySku.get(req.body.platform, req.body.sku);
+  if (!prod) return res.status(404).json({ ok: false, error: '商品不存在' });
+  if (p2.countMonitorsByUser.get(req.user.email).n >= MAX_MONITORS) return res.status(400).json({ ok: false, error: '已达监控上限' });
+  p2.addMonitor.run(req.user.email, prod.id, req.body.target_price || null, Date.now());
+  res.json({ ok: true });
+});
+app.post('/api/unmonitor', requireUser, (req, res) => {
+  const prod = p2.getProductBySku.get(req.body.platform, req.body.sku);
+  if (prod) p2.removeMonitor.run(req.user.email, prod.id);
+  res.json({ ok: true });
+});
+app.post('/api/monitor/batch', requireUser, (req, res) => {
+  const items = (req.body.items || []).slice(0, 5);
+  const n = p2.countMonitorsByUser.get(req.user.email).n;
+  let added = 0, dup = 0, skipped = 0;
+  for (const it of items) {
+    if (n + added >= MAX_MONITORS) { skipped++; continue; }
+    const prod = p2.getProductBySku.get(it.platform, it.sku);
+    if (!prod) { skipped++; continue; }
+    if (p2.isMonitor.get(req.user.email, prod.id)) { dup++; continue; }
+    p2.addMonitor.run(req.user.email, prod.id, it.target_price || null, Date.now());
+    added++;
+  }
+  res.json({ ok: true, added, dup, skipped });
+});
+app.get('/api/monitors', requireUser, (req, res) => {
+  const items = p2.listMonitors.all(req.user.email).map(r => ({ id: r.product_id, platform: r.platform, sku: r.sku, title: r.title, img: r.img, url: r.url, last_price: r.last_price, status: r.status, target_price: r.target_price, observed_at: r.observed_at }));
+  res.json({ items });
+});
+app.get('/api/favorites', requireUser, (req, res) => {
+  const items = p2.listFavorites.all(req.user.email).map(r => ({ id: r.product_id, platform: r.platform, sku: r.sku, title: r.title, img: r.img, url: r.url, last_price: r.last_price, status: r.status }));
+  res.json({ items });
+});
+
+// —— 我的商品监控 页面 ——
+app.get('/app/monitor', requireUser, (req, res) => {
+  const s = layout({ title: '我的商品监控', userEmail: req.user.email, role: req.user.role, active: 'monitor', content: `
+  <div x-data="monitorApp()" x-init="init()">
+    <h1 class="text-2xl font-bold mb-2">我的商品监控</h1>
+    <p class="text-gray-500 mb-5">输入商品名搜索，多平台比价。搜到的商品可「收藏 / 加入监控」。</p>
+    <div class="flex gap-2 mb-5">
+      <input x-model="q" @keydown.enter="search()" placeholder="输入商品名，如 iPhone / 华为" class="flex-1 border rounded-lg px-3 py-2 text-sm">
+      <button @click="search()" class="bg-blue-600 text-white rounded-lg px-4 text-sm">搜索</button>
+    </div>
+    <p x-show="loading" class="text-gray-400 text-sm mb-3">搜索中...</p>
+
+    <template x-for="r in results" :key="r.sku">
+      <div class="bg-white border border-gray-100 rounded-xl p-4 mb-3">
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <div class="font-semibold" x-text="r.title"></div>
+            <div class="text-xs text-gray-400 mt-1" x-text="'来源 ' + (r.platform)"></div>
+          </div>
+          <div class="text-right">
+            <div class="text-xl font-bold" x-text="'¥' + r.price"></div>
+            <div class="text-[11px] text-gray-400">今日价</div>
+          </div>
+        </div>
+        <div class="flex gap-2 mt-3">
+          <button @click="monitor(r)"
+            class="px-3 py-1.5 text-xs rounded-lg" :class="r.monitored ? 'bg-gray-100 text-gray-400' : 'bg-blue-50 text-blue-600'"
+            x-text="r.monitored ? '已监控' : '加入监控'"></button>
+          <button @click="favorite(r)"
+            class="px-3 py-1.5 text-xs rounded-lg" :class="r.favorited ? 'bg-amber-100 text-amber-600' : 'bg-gray-100 text-gray-600'"
+            x-text="r.favorited ? '已收藏' : '收藏'"></button>
+        </div>
+      </div>
+    </template>
+    <p x-show="!loading && results.length===0 && searched" class="text-gray-400 text-sm">没有结果。</p>
+
+    <h2 class="text-lg font-semibold mt-8 mb-3">我的监控（<span x-text="monitors.length"></span>）</h2>
+    <template x-for="m in monitors" :key="m.id">
+      <div class="bg-white border border-gray-100 rounded-xl p-4 mb-2 flex items-center justify-between">
+        <div>
+          <div class="font-medium text-sm" x-text="m.title"></div>
+          <div class="text-xs text-gray-400 mt-1">最新 <span x-text="m.last_price!=null ? '¥'+m.last_price : '—'"></span>
+            <span class="ml-2" x-text="m.status==='stale' ? '（stale·参考）' : ''"></span></div>
+        </div>
+        <button @click="unmonitor(m)" class="text-xs text-red-500">移除</button>
+      </div>
+    </template>
+    <p x-show="monitors.length===0" class="text-gray-400 text-sm">还没有监控的商品。</p>
+  </div>
+  <script>
+  window.monitorApp = function(){ return {
+    q:'', results:[], monitors:[], favorites:[], loading:false, searched:false,
+    init(){ this.loadMonitors(); },
+    async search(){
+      this.loading=true; this.searched=true;
+      const r = await fetch('/api/search?q='+encodeURIComponent(this.q));
+      const d = await r.json(); this.results = d.results; this.loading=false;
+    },
+    async favorite(r){ await fetch(r.favorited?'/api/unfavorite':'/api/favorite',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({platform:r.platform,sku:r.sku})}); r.favorited=!r.favorited; },
+    async monitor(r){ const resp=await fetch('/api/monitor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({platform:r.platform,sku:r.sku})}); const d=await resp.json(); if(d&&d.error){alert(d.error)} r.monitored=true; this.loadMonitors(); },
+    async unmonitor(m){ await fetch('/api/unmonitor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({platform:m.platform,sku:m.sku})}); this.loadMonitors(); },
+    async loadMonitors(){ const r=await fetch('/api/monitors'); const d=await r.json(); this.monitors=d.items; },
+  } };
+  </script>` });
+  res.type('html').send(s);
 });
 
 // ---------- 管理员 ----------
