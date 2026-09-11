@@ -8,6 +8,7 @@ const { layout } = require('./layout');
 const { searchAll, getCurrentPrice } = require('./adapters');
 
 const app = express();
+app.disable('x-powered-by'); // 不发送 X-Powered-By: Express, 不向扫描器暴露技术栈
 const PORT = process.env.PORT || 3000;
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').toLowerCase();
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
@@ -639,10 +640,17 @@ function getLoad() {
   try { l = os.loadavg(); } catch (e) {}
   return { load1: l[0].toFixed(2), load5: l[1].toFixed(2), load15: l[2].toFixed(2), rssMB: Math.round(process.memoryUsage().rss / 1024 / 1024) };
 }
+// 常量时间字符串比较，避免逐字符比较泄露时序（与 sid 签名校验口径一致）
+function safeEqualStr(a, b) {
+  const A = Buffer.from(String(a == null ? '' : a));
+  const B = Buffer.from(String(b == null ? '' : b));
+  return A.length === B.length && crypto.timingSafeEqual(A, B);
+}
 // 外部（1Panel 计划任务/定时 curl）调用；按【去重商品】抓一次，供所有监控者共享；负载高则跳过。
 app.post('/_/cron/refresh-prices', async (req, res) => {
-  // 保护：若设了 CRON_TOKEN，要求请求头 x-cron-token 匹配
-  if (process.env.CRON_TOKEN && req.headers['x-cron-token'] !== process.env.CRON_TOKEN) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  // 保护(fail-closed)：CRON_TOKEN 未配置时一律拒绝 —— 空值不再放行；比较走常量时间
+  if (!process.env.CRON_TOKEN || !safeEqualStr(req.headers['x-cron-token'], process.env.CRON_TOKEN))
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
   const l = getLoad();
   if (Number(l.load1) > REFRESH_MAX_LOAD) return res.json({ ok: false, skipped: true, load: l, msg: '负载过高，跳过本次' });
   const products = p2.listDistinctMonitoredProducts.all();
@@ -829,5 +837,9 @@ app.post('/admin/users', requireAdmin, (req, res) => {
 
 // ---------- 404 ----------
 app.use((req, res) => res.status(404).type('text/plain').send('404 页面不存在'));
+
+// 配置自检：这两个变量缺失时问题不会立刻暴露，先把告警打出来
+if (!process.env.CRON_TOKEN) console.warn('[warn] CRON_TOKEN 未设置 → POST /_/cron/refresh-prices 一律 401，每日报价将不再刷新');
+if (!process.env.SESSION_SECRET) console.warn('[warn] SESSION_SECRET 未设置 → 随机生成，容器每次重启所有登录会话失效');
 
 app.listen(PORT, () => console.log('App listening on :' + PORT));
